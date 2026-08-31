@@ -1,11 +1,15 @@
 from datetime import datetime
 
 from bson import ObjectId
+from fastapi import HTTPException, status
 
 
 def object_id(value: str) -> ObjectId:
     if not ObjectId.is_valid(value):
-        raise ValueError("Invalid object id")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid resource identifier",
+        )
     return ObjectId(value)
 
 

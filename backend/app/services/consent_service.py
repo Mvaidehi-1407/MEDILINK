@@ -21,6 +21,8 @@ class ConsentService:
         if not consent:
             return False
         expires_at = consent.get("expiresAt")
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at and expires_at < datetime.now(timezone.utc):
             await self.db.consents.update_one({"_id": consent["_id"]}, {"$set": {"status": ConsentStatus.EXPIRED.value}})
             return False

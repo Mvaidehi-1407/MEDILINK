@@ -1,0 +1,133 @@
+You are working on my MediLink healthcare project.
+
+IMPORTANT:
+Do NOT restructure, rename, delete, or rewrite existing files unnecessarily.
+First inspect the project exactly as it currently exists and establish a working baseline.
+
+PROJECT GOAL:
+Get the existing MediLink frontend and backend running locally and provide the exact localhost URLs.
+
+STEP 1 — INSPECT THE PROJECT
+1. Identify:
+   - Flutter frontend location
+   - Python/FastAPI backend location
+   - Configuration files
+   - .env and .env.example files
+   - requirements.txt / pyproject.toml
+   - pubspec.yaml
+   - package.json if present
+   - Database configuration
+   - API configuration
+   - Existing authentication implementation
+2. Check whether frontend and backend are complete, partially implemented, or broken.
+3. Do NOT assume missing files or functionality. Inspect the actual code.
+
+STEP 2 — CHECK REQUIRED SOFTWARE
+Check whether the following are installed and available:
+- Flutter
+- Dart
+- Android SDK
+- Java/JDK
+- Python
+- pip
+- Git
+- Node.js/npm if required by the project
+- MongoDB connection requirements
+
+If something required is missing:
+- Install it if installation is possible in the current environment.
+- Otherwise clearly tell me the exact software I need to install.
+- Do not install unnecessary technologies.
+
+STEP 3 — INSTALL PROJECT DEPENDENCIES
+For Flutter:
+- Run flutter pub get
+- Check for dependency conflicts.
+- Do NOT upgrade packages unnecessarily.
+
+For Python/FastAPI:
+- Create/use the existing virtual environment if appropriate.
+- Install dependencies from requirements.txt or pyproject.toml.
+- Do not replace existing dependency versions unless necessary to fix a real issue.
+
+STEP 4 — CHECK ENVIRONMENT CONFIGURATION
+Inspect .env.example and existing .env.
+
+Identify required variables such as:
+- MongoDB URI
+- JWT secret
+- JWT configuration
+- Firebase configuration
+- Twilio configuration
+- CORS origins
+- AI/ML configuration
+
+DO NOT expose real secrets in the final response.
+If required values are missing, clearly list the variable names that need to be configured.
+
+For development, if the project supports safe local/demo defaults, use them instead of requiring production credentials.
+
+STEP 5 — CHECK BACKEND
+Start the FastAPI backend using the project's actual entry point.
+
+Examples only if they match the actual project:
+uvicorn app.main:app --reload
+or
+python -m uvicorn app.main:app --reload
+
+Verify:
+- Server starts successfully
+- /health works
+- /docs works
+- API routes load
+- Database connection works
+- No startup errors
+
+STEP 6 — CHECK FRONTEND
+Run the Flutter application.
+
+Prefer Android emulator/device if available.
+
+If web is supported and useful, also test Flutter web.
+
+Verify:
+- App launches
+- No compilation errors
+- No immediate runtime crash
+- Backend API URL is correctly configured
+- Login/register screens load
+
+STEP 7 — TEST FRONTEND ↔ BACKEND
+Verify that the Flutter frontend can communicate with the FastAPI backend.
+
+Check:
+- API base URL
+- CORS
+- Authentication requests
+- Network connectivity
+- Error handling
+
+Fix ONLY errors necessary to get the existing project running.
+Do not redesign the application.
+
+STEP 8 — FINAL STATUS REPORT
+At the end, give me a concise report containing:
+
+1. Frontend status: PASS/FAIL
+2. Backend status: PASS/FAIL
+3. Database status: CONNECTED/NOT CONNECTED
+4. Dependencies installed
+5. Missing dependencies
+6. Configuration issues
+7. Errors found and fixes made
+8. Backend localhost URL
+9. Swagger/OpenAPI URL
+10. Frontend localhost URL, if web is running
+11. Android emulator/device status
+12. Exact commands used to start frontend and backend
+
+IMPORTANT:
+If a localhost URL is generated, give me the exact clickable URL.
+
+Do NOT claim something is working unless you actually ran and verified it.
+Do NOT create fake credentials in this step.

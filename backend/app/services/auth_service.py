@@ -60,7 +60,7 @@ class AuthService:
             "PATIENT": "patients",
             "CAREGIVER": "caregivers",
             "DOCTOR": "doctors",
-            "HOSPITAL": "hospitals",
+            "HOSPITAL": "hospital_profiles",
         }[user["role"]]
         await MongoRepository(self.db, collection).insert({
             "userId": user["id"],

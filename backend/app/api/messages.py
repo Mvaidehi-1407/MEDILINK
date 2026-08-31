@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.dependencies import db, get_current_user
@@ -12,8 +12,11 @@ router = APIRouter(prefix="/messages", tags=["messages"])
 
 
 @router.get("/{conversation_id}")
-async def list_messages(conversation_id: str, _: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
-    return await MongoRepository(database, "messages").list({"conversationId": conversation_id}, sort=[("timestamp", 1)])
+async def list_messages(conversation_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
+    messages = await MongoRepository(database, "messages").list({"conversationId": conversation_id}, sort=[("timestamp", 1)])
+    if any(user["id"] not in {message["senderId"], message["receiverId"]} for message in messages):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You are not a participant in this conversation")
+    return messages
 
 
 @router.post("")
@@ -29,9 +32,14 @@ async def send_message(payload: MessageCreate, user: dict = Depends(get_current_
 
 
 @router.patch("/{message_id}/read")
-async def mark_read(message_id: str, _: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
-    message = await MongoRepository(database, "messages").update(message_id, {"$set": {"readStatus": "READ"}})
-    if message:
-        await manager.broadcast(f"conversation:{message['conversationId']}", "chat.read", message)
+async def mark_read(message_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
+    repository = MongoRepository(database, "messages")
+    message = await repository.get(message_id)
+    if not message:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    if message["receiverId"] != user["id"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the recipient can mark a message as read")
+    message = await repository.update(message_id, {"$set": {"readStatus": "READ"}})
+    await manager.broadcast(f"conversation:{message['conversationId']}", "chat.read", message)
     return message
 

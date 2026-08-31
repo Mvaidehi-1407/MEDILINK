@@ -1,5 +1,5 @@
 import secrets
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -32,7 +32,10 @@ async def validate_qr(token: str, _: dict = Depends(get_current_user), database:
     qr = await MongoRepository(database, "qr_identities").find_one({"token": token})
     if not qr:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QR token not found")
-    if qr["expiresAt"] < utcnow():
+    expires_at = qr["expiresAt"]
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < utcnow():
         raise HTTPException(status_code=status.HTTP_410_GONE, detail="QR token expired")
     return {"valid": True, "purpose": qr["purpose"], "patientId": qr.get("patientId")}
 
