@@ -1,0 +1,420 @@
+# MediLink Patch — PART 3 of 3 (FULL): Dashboards, Navigation, Motion-Aware Panic Detection & Tiered Escalation, Release
+
+> Depends on Parts 1 and 2 being complete and verified. This version folds in your wearable-device research: motion-based false-positive filtering, a patient confirmation step, and tiered emergency escalation (patient → contact → hospital → optional ambulance).
+
+## Operating Constraints (apply to everything below)
+
+- **Patch, don't rebuild.** Modify the existing MediLink codebase in place. No parallel demo app, no throwaway prototype.
+- **No fake fallbacks** except the Phase 2 Vital Simulator (if built) and the mandatory rule/template fallbacks defined in this plan. Every other "demo mode" branch must be removed, not hidden.
+- **Verified end-to-end only.** A feature is not done because the code exists and compiles — it's done when you've run it live and watched real data move through every hop, with evidence (logs, screenshots, recordings).
+- **Test completely.** Every modified function, edge case, and integration point — not just the phase's headline exit criterion. If shared code/schema changes, re-test everything downstream that depends on it.
+- **Full UI/UX completeness.** Every feature described below needs a real, reachable, populated screen or component — not a stub, not a "coming soon," not a button with no destination. If a page doesn't exist yet for a required feature, build it.
+- **No git commit, push, or merge until explicitly told to.** Work locally, describe the diff/working-tree status, and wait for an explicit go-ahead before any git write action.
+
+---
+
+## PHASE 11 — Real Dashboards (all 4 roles)
+
+| Dashboard | Must have |
+|---|---|
+| Patient | Real trend data in insight panel (Phase 3 risk history). Real medical records section: file picker → real upload to backend/storage → real list → real view/download/delete. Real emergency contact management (add/edit/remove contacts, mark a primary contact). Real supervision/escalation status indicator when relevant (Phase 20). |
+| Doctor | Real assigned-patient list, detail view (readings, emergencies, consent, uploaded records, panic/supervision history), one real write action, real "Generate Report" access |
+| Caregiver | Real linked-patient view, live emergency map pin, real emergency/escalation history, real notification preferences, real acknowledge-alert action (Phase 20) |
+| Hospital | Real live emergency queue (WS-updated, geospatial-filtered) that distinguishes directly-created emergencies from auto-escalated ones, map view, one real status action, real report access |
+
+**Exit criterion:** all four dashboards show real data live and perform their real actions, including patient record upload/view/download and emergency contact management.
+
+---
+
+## PHASE 12 — Messaging, Emergency History, Status Actions
+
+- Real message thread via `/api/messages` + WebSocket, real send/receive.
+- Emergency history pulls real past records, including supervision-mode and escalation-stage history per event.
+- Status-change actions (override/resolve/respond/acknowledge) write for real, reflect immediately via WS/refetch.
+
+**Exit criterion:** a real message sends/receives live; a real status action updates and reflects across connected clients.
+
+---
+
+## PHASE 13 — Loading / Error / Empty States + Offline Banner
+
+- Every API-backed route: real skeleton loading, real error + working Retry, real empty state, real populated state. Audit every screen, including the new records, contacts, supervision, and escalation views.
+- Offline banner: real `connectivity_plus` stream **plus** backend `/healthz` ping (device connectivity and backend reachability are different states — handle both). Reactive show/hide, brief "Reconnecting…" transition, no manual refresh.
+
+**Exit criterion:** all four states confirmed per route; offline banner reflects real state without manual refresh.
+
+---
+
+## PHASE 13.5 — Navigation Audit: Every Button Must Work
+
+- Manually tap **every** button, tab, icon, card, and interactive element across all four roles, including all new screens introduced by Phase 20.
+- Each element must: navigate to a real populated page, perform a real action with visible feedback, or be visibly disabled with a stated reason. No silent no-ops.
+- **If a button has no destination page yet, build the real page** — don't stub it, don't leave it disabled as a workaround, unless the feature is explicitly out of scope (state that explicitly, per Phase 17's pattern).
+- Zero crashes, red/blank screens, or unhandled errors from any tap, on any role.
+- Cover modals, dropdowns, swipe actions, long-press menus, countdown/alert dialogs (Phase 20), and back navigation.
+
+**Testing checklist:**
+- [ ] Full tap-through of every screen for Patient, Doctor, Caregiver, Hospital, including records, contacts, supervision-mode, and escalation-status screens
+- [ ] No dead-end buttons anywhere
+- [ ] Any missing destination page has been built and wired, not stubbed
+- [ ] No crash/error/blank screen from any interaction
+
+**Exit criterion:** every button/tab/interactive element across all roles leads somewhere real, with zero errors and zero dead ends.
+
+---
+
+## PHASE 14 — UI/UX Professional Polish
+
+- One consistent Material 3 design system across all screens — Doctor, Caregiver, Hospital, Reports, Records, Contacts, Supervision/Escalation views.
+- Consistent color tokens, type scale, card/spacing/elevation.
+- Reusable engine-indicator badge ("ML" vs "Rule Fallback"), plus a new **supervision/escalation-stage badge** (e.g. "Supervision Mode", "Patient Alerted", "Contact Notified", "Hospital Escalated") using distinct, accessible colors per stage.
+- Reports render as structured documents with a real export/share action.
+- Restrained motion (no decorative animation in a clinical/emergency context) — but the patient confirmation countdown (Phase 20) should be visually unambiguous and impossible to miss.
+- Accessibility pass: contrast on all status/risk/escalation indicators, text-scaling support.
+- Spot-check every screen against the Patient dashboard baseline.
+
+**Exit criterion:** visual consistency across all screens including Records, Contacts, and Escalation views; accessibility contrast passed.
+
+---
+
+## PHASE 15 — Server-Side Role Authorization
+
+- Cross-role access with a valid-but-wrong-role token must be rejected **server-side**, not just hidden in the UI. Applies to new endpoints too (records, contacts, supervision/escalation actions).
+
+**Exit criterion:** cross-role access rejected with correct HTTP status, for all four roles, across all endpoints including the new ones.
+
+---
+
+## PHASE 16 — Remove Remaining Fake/Static Fallbacks
+
+- Codebase-wide search for leftover `DEMO_MODE`/hardcoded-response branches — confirm each now runs its real path by default.
+
+**Exit criterion:** search for demo/mock/placeholder markers returns nothing outside the Vital Simulator.
+
+---
+
+## PHASE 17 — Explicit Scope Decisions
+
+- **LoRa:** zero implementation exists — state plainly in SIH docs: out of scope for this cycle.
+- **Ambulance-service integration (Phase 20.5, Stage 3 below):** if no real ambulance API/partner is available, state this plainly as out of scope for this cycle too, rather than faking a call. Do not silently drop Stage 3 without documenting the decision.
+
+**Exit criterion:** SIH documentation contains explicit, honest scope statements for both LoRa and (if applicable) ambulance integration.
+
+---
+
+## PHASE 18 — Automated Testing
+
+- Integration tests: auth (4 roles), health-reading ingestion, risk-engine branching (ML + fallback), report-generation branching (LLM + template), emergency state-machine transitions, **supervision-mode entry/exit logic, patient-confirmation timeout logic, and tiered-escalation branching** (Phase 20), panic-classification branching (all categories, both engine paths).
+- API authorization tests confirming server-side role boundaries, including new records/contacts/escalation endpoints.
+
+**Exit criterion:** test suite green, covering risk-engine, report-generation, panic-classification, supervision-mode, and escalation branches.
+
+---
+
+## PHASE 19 — Production Hardening
+
+- Structured backend logging (request IDs, error traces) — including every escalation-stage transition, for audit purposes.
+- Flutter crash reporting via Firebase Crashlytics.
+- Proper release signing config for a signed APK/AAB.
+
+**Exit criterion:** forced error is traceable in logs; forced crash appears in Crashlytics; signed build installs and runs.
+
+---
+
+## PHASE 20 — Panic Attack Detection, Motion-Aware Supervision Mode & Tiered Emergency Escalation
+
+> Extends the Phase 3 Hybrid AI Risk Engine (Part 1) and the Phase 5 Emergency State Machine / Phase 6 GPS / Phase 9 Calling-SMS (Part 2) in place. No separate demo model, no disconnected panic detector, no parallel alert system. This phase directly implements your wearable-device research: motion-based false-positive filtering → patient confirmation → tiered escalation.
+
+### 20.1 Why This Phase Exists
+
+Sudden heart-rate spikes happen during exercise as well as panic. Without context, the system would either miss real panic attacks or fire false alarms during a jog. The fix: fuse vitals with **motion data**, hold ambiguous cases in a **supervision mode**, confirm with the **patient directly** before escalating, and only involve outside parties in **tiers** — contact first, hospital only if the contact doesn't respond, ambulance only if that's genuinely in scope.
+
+### 20.2 Panic-Attack Classification
+
+Retrain/extend the existing ML model to classify:
+
+- `EXPECTED_SITUATIONAL`
+- `UNEXPECTED_SPONTANEOUS`
+- `NOCTURNAL`
+- `LIMITED_SYMPTOM`
+- `RECURRENT`
+- `NONE_DETECTED`
+
+Use `UNKNOWN` internally when data is insufficient to reliably classify — never guess.
+
+### 20.3 ML / Rule Features — Now Including Motion
+
+Use only data actually available from MediLink and the wearable. Where available, include:
+
+- Heart rate + heart-rate change/trend
+- SpO₂, respiratory rate
+- **Motion state (accelerometer/gyroscope): stationary vs. active, and intensity**, sourced the same way real BLE/simulator vitals are — same ingestion path, same schema principle as Phase 2
+- Duration of the abnormal physiological pattern
+- Previous episode history, including whether it occurred during sleep
+- Patient-reported symptoms and trigger/situation (where the patient has provided them)
+
+**Do not fabricate missing features** — if motion data isn't available from a given device/session, the preprocessing layer must handle that explicitly (treat as unknown motion state, not "no motion"), and route to rule-based fallback or a conservative classification rather than guessing.
+
+**Fusion logic (rule-based baseline, refined by the trained model over time):**
+- Abnormal HR **+ motion detected** → likely exercise-driven → enter Supervision Mode (20.4), do not immediately alert.
+- Abnormal HR **+ no motion** → likely panic-relevant → skip supervision, go straight to Patient Confirmation (20.5).
+- Motion state unknown → treat conservatively, same path as "no motion" (do not use ambiguity to suppress a real alert).
+
+### 20.4 Supervision Mode (False-Positive Filtering)
+
+- Triggered when abnormal vitals coincide with detected motion.
+- While in Supervision Mode: continue monitoring vitals + motion at normal sampling rate; do **not** alert the patient or anyone else yet.
+- If vitals normalize (motion-driven spike subsides) → exit Supervision Mode, log the event, no further action.
+- If the abnormality **persists beyond a configurable duration** (default 5–10 minutes, must be a real config value, not hardcoded inline) even while motion continues or after motion stops → escalate to Patient Confirmation (20.5).
+- Supervision Mode entry/exit and duration must be persisted on the record (`supervision_mode`, `supervision_started_at`, `supervision_resolved_at`), not just held in memory.
+
+### 20.5 Patient Confirmation Stage
+
+- Triggered directly (abnormal + no motion) or after Supervision Mode escalates.
+- Alert the patient on-device: vibration + audio + a clear, hard-to-miss on-screen prompt.
+- Present two real actions: **"I'm OK"** and **"I Need Help."**
+- Start a visible countdown (default 30–60 seconds, configurable) shown on screen.
+- **"I'm OK" tapped** → log the event as patient-cancelled, exit, no further escalation.
+- **"I Need Help" tapped, OR countdown expires with no response** → proceed to Tiered Escalation (20.6).
+- This stage must work even if the app is backgrounded (use the same push mechanism as Phase 8) and must be logged either way (`patient_response`: `"OK"` / `"NEED_HELP"` / `"NO_RESPONSE"`).
+
+### 20.6 Tiered Emergency Escalation
+
+**Stage 1 — Emergency Contact:**
+- Automated real call **and** real SMS (Phase 9's infrastructure) to the patient's registered emergency contact(s) (added via the new Phase 11 contact-management screen).
+- Message content, real and data-grounded, not a placeholder:
+  ```
+  This is an emergency alert from MediLink.
+  Patient [Name], age [Age], is experiencing abnormal vitals
+  suggestive of a panic attack.
+  Location: [Latitude, Longitude] — [reverse-geocoded address]
+  Time: [timestamp]
+  Vitals snapshot: HR [value], SpO2 [value]
+  Immediate assistance requested.
+  ```
+- Wait for a real acknowledgment action from the contact (e.g. a link/button in the SMS or a caregiver-app "Acknowledge" action from Phase 11's Caregiver dashboard) within a configurable window (default a few minutes).
+
+**Stage 2 — Hospital Escalation:**
+- If the contact does not acknowledge within the window, automatically escalate to the nearest registered hospital using the GPS + reverse-geocode from Phase 6, surfaced in the Hospital dashboard's live emergency queue (Phase 11), clearly marked as **auto-escalated** (not manually created) so hospital staff can tell the difference.
+- Same real call/SMS mechanism as Stage 1, addressed to the hospital's registered emergency contact number if applicable.
+
+**Stage 3 — Ambulance (scope-check required):**
+- Only implement this if a real ambulance-dispatch API/partner is actually available to you.
+- If not available: **do not fake it.** Document it as out of scope per Phase 17 and stop at Stage 2.
+
+**Escalation state must be persisted at every transition** (`escalation_stage`: `"NONE"` → `"PATIENT_ALERTED"` → `"CONTACT_NOTIFIED"` → `"HOSPITAL_ESCALATED"` → optionally `"AMBULANCE_REQUESTED"`), survives a backend restart, and is visible in real time to Patient, Caregiver, and Hospital dashboards via WebSocket (Phase 10).
+
+### 20.7 Model Training
+
+Actually retrain the model — not a hardcoded rule layered on top of the UI:
+
+1. Prepare a documented training dataset appropriate for SIH/hackathon scope (include motion-labeled data — exercise vs. rest vs. panic-like patterns).
+2. Document whether the dataset is public, synthetic, or a combination.
+3. Engineer the required physiological/motion/symptom features.
+4. Train and validate the model.
+5. Save the trained artifact using the existing MediLink model-loading mechanism.
+6. Increment `model_version`.
+7. Load the new model once at backend startup.
+8. Verify live `/api/health` (and motion) readings reach the updated model.
+9. Store the resulting classification with the existing risk-engine output.
+
+Model must remain lightweight enough for real-time inference.
+
+### 20.8 Existing Hybrid Architecture Must Remain
+
+```
+Vitals + motion + available symptom/context data
+        ↓
+Preprocessing (missing/incompatible inputs handled explicitly)
+        ↓
+Updated ML Model
+        ↓
+General Risk + Panic Pattern Classification + Motion-aware routing
+        ↓
+ML success → engine_used = "ML"
+
+ML failure / timeout / invalid input
+        ↓
+Existing Rule Engine (including the motion fusion rules in 20.3)
+        ↓
+engine_used = "RULE_FALLBACK"
+```
+
+Both paths must produce a valid result and correctly route into Supervision Mode / Patient Confirmation / Escalation as appropriate.
+
+### 20.9 Panic Type Logic
+
+- **EXPECTED/SITUATIONAL** — associated with a reported/identifiable trigger.
+- **UNEXPECTED/SPONTANEOUS** — sudden, no immediate trigger reported.
+- **NOCTURNAL** — occurs during sleep or wakes the patient with panic-like symptoms.
+- **LIMITED-SYMPTOM** — partial/subthreshold pattern.
+- **RECURRENT** — repeated possible episodes from historical data.
+
+If data is insufficient to distinguish a type, store `UNKNOWN`/`NONE_DETECTED` — never guess.
+
+### 20.10 Storage — Extend the Risk/Emergency Record
+
+```json
+{
+  "panic_pattern_detected": true,
+  "panic_attack_type": "UNEXPECTED_SPONTANEOUS",
+  "risk_score": 0.82,
+  "confidence": 0.91,
+  "engine_used": "ML",
+  "model_version": "v2.0-panic",
+  "motion_detected": false,
+  "supervision_mode": false,
+  "supervision_started_at": null,
+  "supervision_resolved_at": null,
+  "patient_response": "NEED_HELP",
+  "escalation_stage": "CONTACT_NOTIFIED",
+  "timestamp": "..."
+}
+```
+
+Preserve all existing fields (`risk_score`, `confidence`, `engine_used`, `timestamp`, `model_version`) alongside the new ones.
+
+### 20.11 No Medical Diagnosis, Ever
+
+- Use: *"Possible panic-attack pattern detected."*
+- Never: *"You are having a panic attack."*
+
+Applies everywhere this surfaces: on-device patient alert, dashboards, notifications, call/SMS scripts, and LLM reports. Frame all output as decision-support for the patient and clinicians, never a diagnosis.
+
+### 20.12 Integration Touchpoints — Update, Don't Bolt On
+
+- **Phase 4 (LLM reports, Part 1):** include `panic_attack_type`, `supervision_mode` history, and `escalation_stage` timeline in the report context; phrase as decision-support.
+- **Phase 5 (emergency state machine, Part 2):** extend states to include Supervision Mode and the tiered escalation stages above — this is a real schema/logic change to that phase, not a Part 3-only addition.
+- **Phase 6 (GPS, Part 2):** location must be attached and included in every escalation-stage message from Stage 1 onward.
+- **Phase 9 (calling/SMS, Part 2):** must support the tiered message templates (contact vs. hospital) and real acknowledgment handling.
+- **Phase 10 (WebSocket, Part 2):** every supervision/escalation transition pushes live to relevant dashboards.
+- **Phase 11 (dashboards, this part):** new contact-management screen (Patient), acknowledge-alert action (Caregiver), auto-escalated flag (Hospital).
+- **Phase 14 (UI/UX, this part):** supervision/escalation-stage badge, unmissable patient-confirmation countdown UI.
+- **Phase 18 (automated tests, this part):** supervision entry/exit, confirmation timeout, and tiered-escalation branching all covered.
+
+### 20.13 New UI/UX Pages & Components Required
+
+- Patient: Emergency Contact management screen (add/edit/remove, mark primary).
+- Patient: On-device Alert screen/modal — "I'm OK" / "I Need Help" with visible countdown, reachable even from a locked/backgrounded state via push.
+- Patient/Caregiver/Hospital: Supervision/Escalation-stage badge component (reused across roles, per Phase 14's design system).
+- Caregiver: "Acknowledge Alert" action, visible escalation timeline for a given patient event.
+- Hospital: Auto-escalated flag/filter in the live emergency queue, distinguishing Stage 2 escalations from directly-created emergencies.
+- All of the above must pass Phase 13.5's navigation audit — reachable, functional, no dead ends.
+
+### 20.14 Mandatory Live Tests
+
+- [ ] Normal data, no motion → `NONE_DETECTED`, no supervision, no alert
+- [ ] Abnormal HR **with motion** → enters Supervision Mode, no immediate alert
+- [ ] Supervision Mode: vitals normalize before timeout → exits cleanly, logged, no escalation
+- [ ] Supervision Mode: abnormality persists past configured duration → escalates to Patient Confirmation
+- [ ] Abnormal HR **without motion** → skips supervision, goes straight to Patient Confirmation
+- [ ] Patient taps "I'm OK" within countdown → cancelled, logged, no escalation
+- [ ] Patient taps "I Need Help" → immediately proceeds to Stage 1 (contact)
+- [ ] No response before countdown expires → automatically proceeds to Stage 1
+- [ ] Contact acknowledges within window → escalation stops at `CONTACT_NOTIFIED`, does not proceed to hospital
+- [ ] Contact does not acknowledge within window → auto-escalates to `HOSPITAL_ESCALATED`, appears flagged in Hospital queue
+- [ ] Situational/spontaneous/nocturnal/limited-symptom/recurrent panic categories each correctly classified from representative test data
+- [ ] Insufficient data → `UNKNOWN`/`NONE_DETECTED`, never invented
+- [ ] ML success → `engine_used: "ML"`; forced ML failure → `engine_used: "RULE_FALLBACK"`; both paths correctly drive supervision/escalation routing
+- [ ] `confidence` and `model_version` stored correctly in both paths
+- [ ] All escalation-stage transitions visible live via WebSocket to Patient, Caregiver, and Hospital dashboards
+- [ ] LLM report includes panic classification and escalation timeline without diagnosing
+
+### 20.15 Model & Workflow Verification Evidence
+
+Do not mark this phase complete because a model file or new UI screen exists. Provide evidence for the full chain:
+
+```
+Training dataset/source (incl. motion-labeled data)
+        ↓
+Training completed → validation/test result → model_version
+        ↓
+Backend loaded updated model
+        ↓
+Live reading (vitals + motion) → ML prediction
+        ↓
+Stored panic_attack_type + motion/supervision/escalation fields
+        ↓
+Correct routing through Supervision → Confirmation → Tiered Escalation
+        ↓
+Real call/SMS fired at the correct stage with correct message content
+```
+
+Include logs, API responses, screenshots, or recordings for each link.
+
+**Exit criterion:** the risk engine is genuinely extended (not a UI label), motion-aware supervision correctly filters exercise-driven spikes, patient confirmation works with a real countdown and both response paths, and tiered escalation correctly progresses from contact → hospital (and ambulance only if genuinely in scope) with real calls/SMS and live dashboard updates — all observed live, both ML and rule-fallback paths.
+
+---
+
+## FINAL ACCEPTANCE TEST — Full End-to-End Flow
+
+Run live, on real devices, confirming each hop:
+
+```
+1. Threshold-breaching reading with MOTION DETECTED → /api/health →
+   preprocessing → ML/rule engine → routes to Supervision Mode
+2. Supervision Mode: vitals normalize → exits cleanly, no alert (test A)
+   (Separately) Supervision Mode: abnormality persists past timeout →
+   escalates to Patient Confirmation (test B)
+3. Threshold-breaching reading with NO MOTION → skips supervision →
+   Patient Confirmation directly
+4. Patient Confirmation: "I'm OK" tapped → cancelled, logged (test C)
+   (Separately) No response / "I Need Help" → escalates to Stage 1 (test D)
+5. Stage 1: real call + real SMS fires to registered emergency contact,
+   correct message content (name, vitals, GPS, timestamp)
+6. Contact acknowledges → escalation stops at CONTACT_NOTIFIED (test E)
+   (Separately) Contact does not acknowledge within window → auto-escalates
+   to HOSPITAL_ESCALATED, flagged in Hospital queue (test F)
+7. Real GPS + reverse-geocode attached and correct at every stage
+8. Real WebSocket updates reach Patient/Caregiver/Hospital dashboards live
+   at every supervision/escalation transition
+9. Emergency resolved → final state persisted, appears in real history with
+   full supervision/escalation timeline
+10. Report requested → real LLM cites engine_used, panic_attack_type, and
+    escalation timeline as decision-support, never diagnosis; forced LLM
+    failure confirms template fallback still delivers a complete report
+11. Full navigation pass (Phase 13.5) across all four roles, including all
+    new Phase 20 screens — zero dead buttons, zero errors
+12. Patient uploads a real medical record → appears in their list → viewable
+    by Doctor with proper access
+13. Patient adds/edits/removes an emergency contact → reflected immediately
+    and used correctly in the next Stage 1 escalation test
+```
+
+**Nothing is complete until its portion of this exact flow has been observed working live.**
+
+---
+
+## FULL REGRESSION CHECKLIST
+
+- [ ] Backend boots clean; no fallback-secret/bcrypt warnings; CORS rejects unlisted origin; missing `.env` hard-fails; rate limiting works; WS auth off the URL
+- [ ] ML risk engine: success + forced-fallback paths confirmed with correct fields
+- [ ] LLM reports: success + forced template-fallback paths confirmed
+- [ ] Real FCM, real call/SMS, real GPS + reverse-geocode all confirmed
+- [ ] All four dashboards show real data with real actions; Patient records upload/view/download confirmed; emergency contact management confirmed
+- [ ] Every route's four states (loading/error/empty/populated) confirmed; offline banner reflects real state
+- [ ] Full navigation audit passed: every button/tab reaches a real page or action, no dead ends, missing pages were built, zero crashes — including all new Phase 20 screens
+- [ ] Cross-role access rejected server-side, all four roles, including new endpoints
+- [ ] Crashlytics fires on forced crash; signed release build installs and runs
+- [ ] Motion-aware Supervision Mode correctly filters an exercise-driven HR spike (no false alert) and correctly escalates a persistent abnormality
+- [ ] Patient Confirmation countdown works for both "I'm OK" and "I Need Help"/no-response paths
+- [ ] Tiered escalation correctly progresses contact → hospital, with real call/SMS and correct message content at each stage; ambulance stage genuinely implemented or explicitly scoped out
+- [ ] All escalation-stage transitions persisted and visible live via WebSocket to all relevant roles
+- [ ] All Phase 20 panic-classification tests pass (all categories + insufficient-data case), both engine paths, training evidence documented
+- [ ] Automated test suite green: risk-engine, report-generation, panic-classification, supervision-mode, and escalation branches
+- [ ] Original flows (register → login → logout → login → dashboard) still pass
+- [ ] Nothing committed, pushed, or merged without explicit sign-off
+
+---
+
+## DELIVERABLE
+
+Updated completion table + changelog of what moved from demo/pending to real, including:
+
+- Phase 3 test results (ML success + forced fallback)
+- Phase 4 test results (LLM success + forced template fallback)
+- Phase 20 full test results: panic classification (all categories), motion-aware supervision mode, patient confirmation, and tiered escalation (all stages, both branches at each decision point)
+- LoRa scope statement, and ambulance-integration scope statement if Stage 3 wasn't implemented
+- Re-scored SIH readiness (from 58%), reflecting the complete motion-aware panic detection and tiered escalation system as a genuine differentiator
+
+**Do not commit, push, or merge any of this work until explicitly told to.** Present the diff/working-tree status and wait for a go-ahead.

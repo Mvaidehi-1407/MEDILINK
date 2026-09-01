@@ -1,25 +1,42 @@
 from pymongo import DESCENDING
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.models.enums import RiskLevel
 from app.repositories.base import MongoRepository
-from app.risk.risk_service import RiskService
-from app.schemas.health import HealthReadingCreate
+from app.risk.hybrid_engine import HybridRiskEngine
+from app.risk.panic_engine import PanicAssessment, PanicEngine
+from app.schemas.health import HealthReadingCreate, RiskResult
 from app.utils.time import utcnow
 
 
 class HealthService:
-    def __init__(self, db: AsyncIOMotorDatabase, risk_service: RiskService | None = None):
+    def __init__(self, db: AsyncIOMotorDatabase, risk_engine: HybridRiskEngine | None = None, panic_engine: PanicEngine | None = None):
         self.db = db
         self.repo = MongoRepository(db, "health_readings")
-        self.risk_service = risk_service or RiskService()
+        self.risk_engine = risk_engine or HybridRiskEngine()
+        self.panic_engine = panic_engine or PanicEngine(db)
 
-    async def record_reading(self, payload: HealthReadingCreate) -> dict:
+    async def record_reading(self, payload: HealthReadingCreate) -> tuple[dict, RiskResult, PanicAssessment]:
+        """Returns (stored reading incl. risk+panic fields, the RiskResult, the PanicAssessment)."""
         reading = payload.model_dump()
         reading["timestamp"] = payload.timestamp or utcnow()
-        risk = self.risk_service.evaluate(HealthReadingCreate(**reading))
+        normalized = HealthReadingCreate(**reading)
+        risk = await self.risk_engine.evaluate(normalized)
+        panic = await self.panic_engine.assess(normalized, risk.riskLevel)
+
+        # A single engine_used covers the whole record: if either the risk or panic
+        # classification had to fall back to rules, the record is honestly marked as such.
+        engine_used = "ML" if risk.engineUsed == "ML" and panic.engine_used == "ML" else "RULE_FALLBACK"
+        risk.confidence = min(risk.confidence, panic.confidence)
+        risk.panicPatternDetected = panic.panic_pattern_detected
+        risk.panicAttackType = panic.panic_attack_type
+        risk.motionDetected = panic.motion_detected
+        if panic.engine_used == "ML" and risk.engineUsed == "ML":
+            risk.modelVersion = f"{risk.modelVersion}+{panic.model_version}"
+        risk.engineUsed = engine_used
+
         reading["risk"] = risk.model_dump(mode="json")
-        return await self.repo.insert(reading)
+        stored = await self.repo.insert(reading)
+        return stored, risk, panic
 
     async def current(self, patient_id: str) -> dict | None:
         rows = await self.history(patient_id, limit=1)
@@ -42,8 +59,3 @@ class HealthService:
             "minHeartRate": min(hrs),
             "maxHeartRate": max(hrs),
         }
-
-    @staticmethod
-    def is_high_risk(reading: dict) -> bool:
-        risk = reading.get("risk", {})
-        return risk.get("riskLevel") == RiskLevel.HIGH_RISK.value

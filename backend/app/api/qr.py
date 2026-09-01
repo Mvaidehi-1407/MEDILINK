@@ -37,5 +37,22 @@ async def validate_qr(token: str, _: dict = Depends(get_current_user), database:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if expires_at < utcnow():
         raise HTTPException(status_code=status.HTTP_410_GONE, detail="QR token expired")
-    return {"valid": True, "purpose": qr["purpose"], "patientId": qr.get("patientId")}
+
+    result = {"valid": True, "purpose": qr["purpose"], "patientId": qr.get("patientId")}
+    patient_id = qr.get("patientId")
+    if patient_id:
+        patient = await MongoRepository(database, "users").get(patient_id)
+        if patient:
+            result["patient"] = {
+                "name": patient.get("name"),
+                "age": patient.get("age"),
+                "phone": patient.get("phone"),
+            }
+        contacts = await MongoRepository(database, "emergency_contacts").list(
+            {"patientId": patient_id}, limit=3, sort=[("priority", 1)],
+        )
+        result["emergencyContacts"] = [
+            {"name": c.get("name"), "phone": c.get("phone")} for c in contacts
+        ]
+    return result
 

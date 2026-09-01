@@ -34,6 +34,17 @@ class EmergencyResolveRequest(BaseModel):
     resolutionNotes: Optional[str] = None
 
 
+class CommResultRequest(BaseModel):
+    """Reported by the patient's own device after it attempts a relayed native SMS/call to a
+    caretaker -- the device's real, observed outcome, never fabricated by the backend."""
+    channel: str = Field(pattern=r"^(sms|call)$")
+    status: str = Field(pattern=r"^(INITIATED|SENT|FAILED|UNAVAILABLE)$")
+    contactPhone: str
+    cycle: int
+    priority: int
+    errorMessage: Optional[str] = None
+
+
 class EmergencyOut(BaseModel):
     id: str
     patientId: str

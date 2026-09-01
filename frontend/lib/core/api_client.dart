@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 import 'session.dart';
 
@@ -86,9 +87,9 @@ class ApiClient {
     }
   }
 
-  Future<Map<String, dynamic>> login(String email, String password) async =>
+  Future<Map<String, dynamic>> login(String identifier, String password) async =>
       Map<String, dynamic>.from(
-        await post('/auth/login', body: {'email': email, 'password': password})
+        await post('/auth/login', body: {'identifier': identifier, 'password': password})
             as Map,
       );
 
@@ -97,10 +98,19 @@ class ApiClient {
     required String email,
     required String password,
     required String role,
+    required String phone,
+    List<Map<String, String>>? caretakers,
   }) async => Map<String, dynamic>.from(
     await post(
       '/auth/register',
-      body: {'name': name, 'email': email, 'password': password, 'role': role},
+      body: {
+        'name': name,
+        'email': email,
+        'password': password,
+        'role': role,
+        'phone': phone,
+        if (caretakers != null) 'caretakers': caretakers,
+      },
     ) as Map,
   );
 
@@ -136,6 +146,8 @@ class ApiClient {
   );
   Future<List<Map<String, dynamic>>> emergencies(String patientId) =>
       list('/emergencies/patient/$patientId');
+  Future<List<Map<String, dynamic>>> activeEmergencies() =>
+      list('/emergencies/active');
   Future<Map<String, dynamic>> emergencyAction(
     String id,
     String action, [
@@ -143,6 +155,74 @@ class ApiClient {
   ]) async => Map<String, dynamic>.from(
     await post('/emergencies/$id/$action', body: body ?? const {}) as Map,
   );
+
+  /// Unauthenticated backend status (call provider / mode), used only to render an honest
+  /// "sandbox — verified numbers only" style notice rather than hardcoding it in the UI.
+  Future<Map<String, dynamic>> systemStatus() async {
+    final root = (_session.apiBaseUrl ?? _defaultBaseUrl).replaceFirst(RegExp(r'/api$'), '');
+    final response = await _client.get(Uri.parse('$root/healthz')).timeout(const Duration(seconds: 10));
+    return Map<String, dynamic>.from(jsonDecode(response.body) as Map);
+  }
+
+  // ---- Phase 20: emergency contacts, panic/escalation actions ----------------------------
+  Future<List<Map<String, dynamic>>> emergencyContacts() => list('/contacts');
+  Future<Map<String, dynamic>> addEmergencyContact({
+    required String name,
+    required String phone,
+    String? relation,
+    bool isPrimary = false,
+  }) async => Map<String, dynamic>.from(
+    await post('/contacts', body: {
+      'name': name,
+      'phone': phone,
+      if (relation != null && relation.isNotEmpty) 'relation': relation,
+      'isPrimary': isPrimary,
+    }) as Map,
+  );
+  Future<Map<String, dynamic>> updateEmergencyContact(String id, Map<String, dynamic> updates) async =>
+      Map<String, dynamic>.from(await patch('/contacts/$id', body: updates) as Map);
+  Future<void> deleteEmergencyContact(String id) => delete('/contacts/$id');
+  Future<Map<String, dynamic>> acknowledgeContactAlert(String emergencyId) async =>
+      Map<String, dynamic>.from(await post('/emergencies/$emergencyId/acknowledge-contact') as Map);
+  Future<Map<String, dynamic>> getEmergency(String id) async =>
+      Map<String, dynamic>.from(await get('/emergencies/$id') as Map);
+
+  // ---- Medical records: real upload/list/download/delete against GridFS -------------------
+  Future<List<Map<String, dynamic>>> medicalRecords({String? patientId}) =>
+      list('/medical-records', query: patientId != null ? {'patientId': patientId} : null);
+
+  Future<Map<String, dynamic>> uploadMedicalRecord({
+    required String patientId,
+    required String category,
+    required String filename,
+    required List<int> bytes,
+    required String contentType,
+  }) async {
+    final token = _session.accessToken;
+    final request = http.MultipartRequest('POST', _uri('/medical-records/upload'))
+      ..fields['patientId'] = patientId
+      ..fields['category'] = category
+      ..files.add(http.MultipartFile.fromBytes('file', bytes, filename: filename, contentType: MediaType.parse(contentType)));
+    if (token != null) request.headers['Authorization'] = 'Bearer $token';
+    final streamed = await _client.send(request).timeout(const Duration(seconds: 60));
+    final text = await streamed.stream.bytesToString();
+    final data = text.isEmpty ? null : jsonDecode(text);
+    if (streamed.statusCode >= 200 && streamed.statusCode < 300) {
+      return Map<String, dynamic>.from(data as Map);
+    }
+    final detail = data is Map && data['detail'] != null ? data['detail'].toString() : 'Upload failed (${streamed.statusCode})';
+    throw ApiException(detail, statusCode: streamed.statusCode);
+  }
+
+  Future<List<int>> downloadMedicalRecord(String recordId) async {
+    final token = _session.accessToken;
+    final headers = <String, String>{if (token != null) 'Authorization': 'Bearer $token'};
+    final response = await _client.get(_uri('/medical-records/$recordId'), headers: headers).timeout(const Duration(seconds: 60));
+    if (response.statusCode >= 200 && response.statusCode < 300) return response.bodyBytes;
+    throw ApiException('Download failed (${response.statusCode})', statusCode: response.statusCode);
+  }
+
+  Future<void> deleteMedicalRecord(String recordId) => delete('/medical-records/$recordId');
 }
 
 final apiClientProvider = Provider<ApiClient>(

@@ -1,0 +1,11 @@
+## Copy this file to android/key.properties (never commit the real one) and fill in real values
+## from a keystore you generate yourself, e.g.:
+##   keytool -genkey -v -keystore medilink-release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias medilink
+##
+## Until this file exists, release builds fall back to the debug signing key (with a Gradle
+## warning) so `flutter build apk --release` still works for local testing.
+
+storePassword=changeme
+keyPassword=changeme
+keyAlias=medilink
+storeFile=../medilink-release.jks

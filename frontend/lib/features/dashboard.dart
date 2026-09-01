@@ -1,15 +1,26 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../core/api_client.dart';
+import '../core/crash_reporting.dart';
+import '../core/native_comm_service.dart';
+import '../core/realtime_service.dart';
 import '../core/session.dart';
+import '../core/vitals_simulator.dart';
 import '../widgets/common.dart';
+import 'contacts.dart';
+import 'emergency_map.dart';
+import 'medical_vault.dart';
+import 'messaging.dart';
+import 'patients.dart';
 
 void _open(BuildContext c, Widget p) =>
     Navigator.of(c).push(MaterialPageRoute(builder: (_) => p));
@@ -94,6 +105,7 @@ class _RoleShellState extends ConsumerState<RoleShell> {
       bottomNavigationBar: NavigationBar(
         selectedIndex: index,
         onDestinationSelected: (v) => setState(() => index = v),
+        labelTextStyle: WidgetStateProperty.all(const TextStyle(fontSize: 11)),
         destinations: labels
             .map((l) => NavigationDestination(icon: Icon(_icon(l)), label: l))
             .toList(),
@@ -154,6 +166,11 @@ class RoleOverview extends StatelessWidget {
               Icons.local_hospital_outlined,
               () => _open(context, const HospitalsPage()),
             ),
+            ActionTile(
+              'Map',
+              Icons.map_outlined,
+              () => _open(context, const EmergencyMapPage()),
+            ),
           ],
         ),
       ],
@@ -169,19 +186,23 @@ class ActionTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) => SizedBox(
     width: 112,
-    height: 96,
+    height: 104,
     child: InkWell(
       onTap: tap,
       child: SectionCard(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon, color: MedilinkColors.blue),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             Text(
               label,
               textAlign: TextAlign.center,
-              style: const TextStyle(fontWeight: FontWeight.w700),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12),
             ),
           ],
         ),
@@ -200,11 +221,49 @@ final currentReadingProvider =
       }
     });
 
-class PatientHome extends ConsumerWidget {
+class PatientHome extends ConsumerStatefulWidget {
   const PatientHome({super.key});
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<PatientHome> createState() => _PatientHomeState();
+}
+
+class _PatientHomeState extends ConsumerState<PatientHome> {
+  RealtimeConnection? _connection;
+  StreamSubscription? _subscription;
+  String? _patientId;
+
+  void _ensureSubscribed(String patientId) {
+    if (_patientId == patientId && _connection != null) return;
+    _subscription?.cancel();
+    _connection?.dispose();
+    _patientId = patientId;
+    _connection = RealtimeService(ref.read(sessionProvider.notifier)).patientChannel(patientId);
+    // Live update reaches the UI with no manual refresh: any health.reading or
+    // emergency.updated push from the backend invalidates the current-reading provider.
+    _subscription = _connection!.events.listen((event) {
+      if (mounted) ref.invalidate(currentReadingProvider(patientId));
+      if (event['event'] == 'escalation.attempt') {
+        final data = Map<String, dynamic>.from(event['data'] as Map);
+        final emergencyId = data['emergencyId']?.toString();
+        if (emergencyId != null) {
+          NativeCommService().handleEscalationAttempt(ref.read(apiClientProvider), emergencyId, data);
+        }
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    _connection?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final id = ref.watch(sessionProvider).userId;
+    if (id.isNotEmpty) _ensureSubscribed(id);
+    final reading = ref.watch(currentReadingProvider(id));
     return PageFrame(
       title: 'Good day',
       actions: [
@@ -218,25 +277,7 @@ class PatientHome extends ConsumerWidget {
         children: [
           HealthStatusCard(patientId: id),
           const SizedBox(height: 16),
-          const SectionCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'AI insight',
-                  style: TextStyle(fontWeight: FontWeight.w800),
-                ),
-                SizedBox(height: 8),
-                Text(
-                  'Your recent readings are within your configured monitoring range.',
-                ),
-                Text(
-                  'Informational only.',
-                  style: TextStyle(color: Colors.blueGrey),
-                ),
-              ],
-            ),
-          ),
+          AiInsightCard(reading: reading),
           const SizedBox(height: 20),
           Wrap(
             spacing: 10,
@@ -305,6 +346,10 @@ class HealthStatusCard extends ConsumerWidget {
                       style: TextStyle(fontWeight: FontWeight.w800),
                     ),
                   ),
+                  if (data?['source'] == 'DEMO') ...[
+                    const DevSimulatedBadge(),
+                    const SizedBox(width: 8),
+                  ],
                   StatusBadge(
                     label: risk?['riskLevel']?.toString() ?? 'STABLE',
                   ),
@@ -335,43 +380,123 @@ class HealthStatusCard extends ConsumerWidget {
   }
 }
 
+class DevSimulatedBadge extends StatelessWidget {
+  const DevSimulatedBadge({super.key});
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    decoration: BoxDecoration(
+      color: MedilinkColors.amber.withValues(alpha: .15),
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: MedilinkColors.amber.withValues(alpha: .4)),
+    ),
+    child: const Text(
+      'DEV/SIMULATED',
+      style: TextStyle(
+        color: MedilinkColors.amber,
+        fontWeight: FontWeight.w800,
+        fontSize: 10,
+      ),
+    ),
+  );
+}
+
+class AiInsightCard extends StatelessWidget {
+  const AiInsightCard({super.key, required this.reading});
+  final AsyncValue<Map<String, dynamic>?> reading;
+  @override
+  Widget build(BuildContext context) {
+    return reading.when(
+      loading: () => const SectionCard(
+        child: SizedBox(height: 90, child: LoadingState(label: 'Analyzing...')),
+      ),
+      error: (e, s) => const SizedBox.shrink(),
+      data: (data) {
+        final risk = data?['risk'] as Map?;
+        final recommendation = risk?['recommendation']?.toString();
+        final engineUsed = risk?['engineUsed']?.toString();
+        final isSimulated = data?['source'] == 'DEMO';
+        return SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'AI insight',
+                      style: TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                  if (isSimulated) const DevSimulatedBadge(),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                recommendation ??
+                    'No readings yet. Insight will appear once vitals are recorded.',
+              ),
+              if (engineUsed != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  'Engine: $engineUsed',
+                  style: const TextStyle(color: Colors.blueGrey, fontSize: 12),
+                ),
+              ],
+              const Text(
+                'Informational only. Not a medical diagnosis.',
+                style: TextStyle(color: Colors.blueGrey),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
 class HealthPage extends ConsumerWidget {
   const HealthPage({super.key});
   @override
-  Widget build(BuildContext context, WidgetRef ref) => PageFrame(
-    title: 'Health',
-    child: ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        HealthStatusCard(patientId: ref.watch(sessionProvider).userId),
-        const SizedBox(height: 16),
-        const SectionCard(
-          child: SizedBox(
-            height: 130,
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text('Health trends: 24H | 7D | 30D'),
-                Icon(Icons.show_chart, size: 64, color: MedilinkColors.teal),
-              ],
+  Widget build(BuildContext context, WidgetRef ref) {
+    final devModeEnabled = ref.watch(sessionProvider).devModeEnabled;
+    return PageFrame(
+      title: 'Health',
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          HealthStatusCard(patientId: ref.watch(sessionProvider).userId),
+          const SizedBox(height: 16),
+          const SectionCard(
+            child: SizedBox(
+              height: 130,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text('Health trends: 24H | 7D | 30D'),
+                  Icon(Icons.show_chart, size: 64, color: MedilinkColors.teal),
+                ],
+              ),
             ),
           ),
-        ),
-        const SizedBox(height: 16),
-        PrimaryButton(
-          label: 'BLE devices',
-          onPressed: () => _open(context, const BlePage()),
-          icon: Icons.bluetooth_outlined,
-        ),
-        const SizedBox(height: 10),
-        OutlinedButton.icon(
-          onPressed: () => _open(context, const SimulatorPage()),
-          icon: const Icon(Icons.science_outlined),
-          label: const Text('Open development simulator'),
-        ),
-      ],
-    ),
-  );
+          const SizedBox(height: 16),
+          PrimaryButton(
+            label: 'BLE devices',
+            onPressed: () => _open(context, const BlePage()),
+            icon: Icons.bluetooth_outlined,
+          ),
+          if (devModeEnabled) ...[
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: () => _open(context, const SimulatorPage()),
+              icon: const Icon(Icons.science_outlined),
+              label: const Text('Open development simulator (Dev Mode)'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 }
 
 class SimulatorPage extends ConsumerStatefulWidget {
@@ -381,86 +506,123 @@ class SimulatorPage extends ConsumerStatefulWidget {
 }
 
 class _SimulatorPageState extends ConsumerState<SimulatorPage> {
-  String mode = 'NORMAL';
+  final _engine = VitalsSimulatorEngine();
+  SimulatedVitals? preview;
   bool sending = false;
+  bool streaming = false;
+  Timer? _streamTimer;
   String? result;
-  static const data = {
-    'NORMAL': [72, 98, 120, 80],
-    'WARNING': [110, 93, 145, 90],
-    'HIGH_RISK': [145, 87, 170, 110],
-  };
+
   @override
-  Widget build(BuildContext context) => PageFrame(
-    title: 'Health simulator',
-    child: Padding(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const StatusBadge(label: 'SIMULATED DATA'),
-          const SizedBox(height: 16),
-          const Text(
-            'Development-only readings are submitted through the same backend pipeline as BLE data.',
-          ),
-          const SizedBox(height: 16),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'NORMAL', label: Text('Normal')),
-              ButtonSegment(value: 'WARNING', label: Text('Warning')),
-              ButtonSegment(value: 'HIGH_RISK', label: Text('High risk')),
-            ],
-            selected: {mode},
-            onSelectionChanged: (v) => setState(() => mode = v.first),
-          ),
-          const SizedBox(height: 20),
-          Text(
-            'HR ${data[mode]![0]} | SpO2 ${data[mode]![1]}% | BP ${data[mode]![2]}/${data[mode]![3]}',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-          if (result != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 16),
-              child: Text(result!),
+  void initState() {
+    super.initState();
+    setState(() => preview = _engine.next());
+  }
+
+  @override
+  void dispose() {
+    _streamTimer?.cancel();
+    super.dispose();
+  }
+
+  void _toggleStreaming(bool value) {
+    setState(() => streaming = value);
+    if (value) {
+      _streamTimer = Timer.periodic(const Duration(seconds: 5), (_) => _send());
+    } else {
+      _streamTimer?.cancel();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final v = preview;
+    return PageFrame(
+      title: 'Health simulator',
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const DevSimulatedBadge(),
+            const SizedBox(height: 16),
+            const Text(
+              'Development-only readings with realistic natural variation and occasional threshold-breaching '
+              'spikes are submitted through the exact same /api/health pipeline a real BLE reading would use.',
             ),
-          const Spacer(),
-          PrimaryButton(
-            label: 'Submit to monitoring pipeline',
-            loading: sending,
-            onPressed: _send,
-            icon: Icons.send_outlined,
-          ),
-        ],
+            const SizedBox(height: 20),
+            if (v != null) ...[
+              Text(
+                'HR ${v.heartRate} | SpO2 ${v.spo2}% | BP ${v.systolicBP}/${v.diastolicBP} | Temp ${v.temperature}C',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Generator regime: ${v.regime}',
+                style: const TextStyle(color: Colors.blueGrey),
+              ),
+            ],
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              onPressed: streaming ? null : () => setState(() => preview = _engine.next()),
+              icon: const Icon(Icons.refresh),
+              label: const Text('Generate new reading'),
+            ),
+            const SizedBox(height: 16),
+            SwitchListTile(
+              value: streaming,
+              onChanged: _toggleStreaming,
+              title: const Text('Auto-stream every 5s'),
+              subtitle: const Text('Mimics a continuously connected wearable pushing readings.'),
+            ),
+            if (result != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(result!),
+              ),
+            const Spacer(),
+            PrimaryButton(
+              label: streaming ? 'Streaming to monitoring pipeline...' : 'Submit to monitoring pipeline',
+              loading: sending,
+              onPressed: streaming ? null : _send,
+              icon: Icons.send_outlined,
+            ),
+          ],
+        ),
       ),
-    ),
-  );
+    );
+  }
+
   Future<void> _send() async {
+    final v = preview ?? _engine.next();
     setState(() {
       sending = true;
       result = null;
     });
     try {
-      final v = data[mode]!;
       final r = await ref.read(apiClientProvider).submitReading({
         'patientId': ref.read(sessionProvider).userId,
-        'heartRate': v[0],
-        'spo2': v[1],
-        'systolicBP': v[2],
-        'diastolicBP': v[3],
-        'temperature': 36.8,
+        'heartRate': v.heartRate,
+        'spo2': v.spo2,
+        'systolicBP': v.systolicBP,
+        'diastolicBP': v.diastolicBP,
+        'temperature': v.temperature,
         'deviceId': 'development-simulator',
         'source': 'DEMO',
       });
       final reading = r['reading'] as Map;
       final emergency = r['emergency'] as Map?;
-      setState(
-        () => result =
-            'Backend accepted reading. Risk: ${(reading['risk'] as Map?)?['riskLevel'] ?? 'UNKNOWN'}${r['emergency'] == null ? '' : '. Emergency verification started.'}',
-      );
-      if (emergency != null && mounted) {
+      if (!mounted) return;
+      setState(() {
+        result =
+            'Backend accepted reading. Risk: ${(reading['risk'] as Map?)?['riskLevel'] ?? 'UNKNOWN'}${r['emergency'] == null ? '' : '. Emergency verification started.'}';
+        preview = _engine.next();
+      });
+      if (emergency != null && mounted && !streaming) {
         await Navigator.of(context).push(MaterialPageRoute(builder: (_) => EmergencyPage(emergencyId: emergency['id'].toString())));
       }
     } on ApiException catch (e) {
-      setState(() => result = e.message);
+      if (mounted) setState(() => result = e.message);
     } finally {
       if (mounted) setState(() => sending = false);
     }
@@ -553,69 +715,328 @@ class EmergencyPage extends ConsumerStatefulWidget {
 }
 
 class _EmergencyPageState extends ConsumerState<EmergencyPage> {
-  int seconds = 10;
+  int seconds = 45;
   Timer? timer;
+  Timer? hapticTimer;
   bool busy = false;
+  bool loadingCountdown = true;
   String? message;
+  String? callProviderMode;
+  String? panicAttackType;
+
   @override
-  void initState() { super.initState(); if (widget.emergencyId != null) { timer = Timer.periodic(const Duration(seconds: 1), (value) { if (seconds == 0) { value.cancel(); _action('no-response'); } else if (mounted) { setState(() => seconds--); } }); } }
+  void initState() {
+    super.initState();
+    if (widget.emergencyId != null) {
+      _loadCountdownAndStart();
+      // Patient Confirmation must be impossible to miss (20.5/20.13) -- this is the one
+      // screen in the app that deliberately breaks the "no decorative motion" rule with a
+      // repeating haptic pulse, since a missed alert here is the worst possible outcome.
+      hapticTimer = Timer.periodic(const Duration(milliseconds: 900), (_) => HapticFeedback.heavyImpact());
+      HapticFeedback.heavyImpact();
+    }
+    ref.read(apiClientProvider).systemStatus().then((status) {
+      if (mounted) setState(() => callProviderMode = status['callProviderMode']?.toString());
+    }).catchError((_) {});
+  }
+
+  Future<void> _loadCountdownAndStart() async {
+    try {
+      final emergency = await ref.read(apiClientProvider).getEmergency(widget.emergencyId!);
+      panicAttackType = emergency['panicAttackType']?.toString();
+      final timeline = (emergency['timeline'] as List?) ?? const [];
+      final verificationEvent = timeline.lastWhere(
+        (e) => e is Map && e['event'] == 'VERIFICATION',
+        orElse: () => null,
+      );
+      if (verificationEvent is Map) {
+        final details = verificationEvent['details'];
+        if (details is Map && details['countdownSeconds'] is int) {
+          seconds = details['countdownSeconds'] as int;
+        }
+      }
+    } catch (_) {
+      // Keep the sane default (45s) if the emergency can't be fetched -- the countdown still
+      // runs rather than stalling the patient-confirmation flow.
+    }
+    if (mounted) setState(() => loadingCountdown = false);
+    timer = Timer.periodic(const Duration(seconds: 1), (value) {
+      if (seconds == 0) {
+        value.cancel();
+        _action('no-response');
+      } else if (mounted) {
+        setState(() => seconds--);
+      }
+    });
+  }
+
   @override
-  void dispose() { timer?.cancel(); super.dispose(); }
+  void dispose() {
+    timer?.cancel();
+    hapticTimer?.cancel();
+    super.dispose();
+  }
+
   Future<void> _action(String action) async {
     if (widget.emergencyId == null || busy) return;
-    timer?.cancel(); setState(() => busy = true);
+    timer?.cancel();
+    hapticTimer?.cancel();
+    setState(() => busy = true);
     try {
-      final body = action == 'cancel' ? {'patientResponse': 'IM_OK', 'reason': 'Patient confirmed safe'} : action == 'confirm' ? {'patientResponse': 'GET_HELP'} : null;
+      Map<String, dynamic>? body;
+      if (action == 'cancel') {
+        body = {'patientResponse': 'IM_OK', 'reason': 'Patient confirmed safe'};
+      } else if (action == 'confirm') {
+        body = {'patientResponse': 'NEED_HELP'};
+        // Real device GPS, captured at confirm time -- no mocked/hardcoded coordinates.
+        try {
+          var permission = await Geolocator.checkPermission();
+          if (permission == LocationPermission.denied) {
+            permission = await Geolocator.requestPermission();
+          }
+          if (permission != LocationPermission.denied && permission != LocationPermission.deniedForever) {
+            final position = await Geolocator.getCurrentPosition(
+              locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+            );
+            body['location'] = {'latitude': position.latitude, 'longitude': position.longitude};
+          }
+        } catch (_) {
+          // Location capture failed (permission denied / GPS off) -- confirm still proceeds
+          // without coordinates rather than sending a fake location.
+        }
+      }
       final response = await ref.read(apiClientProvider).emergencyAction(widget.emergencyId!, action, body);
       if (mounted) setState(() => message = 'Emergency status: ${response['status']}');
-    } on ApiException catch (error) { if (mounted) setState(() => message = error.message); } finally { if (mounted) setState(() => busy = false); }
+    } on ApiException catch (error) {
+      if (mounted) setState(() => message = error.message);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
   }
-  @override
-  Widget build(BuildContext context) => PageFrame(title: 'Emergency', child: Padding(padding: const EdgeInsets.all(16), child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-    const Icon(Icons.emergency, size: 82, color: MedilinkColors.red), const SizedBox(height: 20), Text('POTENTIAL EMERGENCY', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900, color: MedilinkColors.red)), const SizedBox(height: 12), const Text('An abnormal health pattern has been detected.', textAlign: TextAlign.center), if (widget.emergencyId != null) ...[const SizedBox(height: 16), Text('Verification countdown: $seconds', style: Theme.of(context).textTheme.displaySmall?.copyWith(fontWeight: FontWeight.w900))], const SizedBox(height: 20), PrimaryButton(label: "I'm OK", onPressed: widget.emergencyId == null ? () => Navigator.pop(context) : () => _action('cancel'), loading: busy, icon: Icons.check_circle_outline), const SizedBox(height: 12), SizedBox(width: double.infinity, height: 54, child: FilledButton.icon(style: FilledButton.styleFrom(backgroundColor: MedilinkColors.red), onPressed: widget.emergencyId == null ? null : () => _action('confirm'), icon: const Icon(Icons.call), label: const Text('GET HELP'))), if (message != null) Padding(padding: const EdgeInsets.only(top: 16), child: Text(message!)), const SizedBox(height: 20), const Text('PRESS AND HOLD FOR SOS', style: TextStyle(fontWeight: FontWeight.w800, color: MedilinkColors.red))])));
-}
 
-class EmergencyList extends ConsumerWidget {
-  const EmergencyList({super.key});
   @override
-  Widget build(BuildContext context, WidgetRef ref) => PageFrame(
-    title: 'Emergency alerts',
-    child: FutureBuilder<List<Map<String, dynamic>>>(
-      future: ref
-          .read(apiClientProvider)
-          .emergencies(ref.watch(sessionProvider).userId),
-      builder: (c, s) {
-        if (!s.hasData) return const LoadingState();
-        if (s.data!.isEmpty)
-          return const EmptyState(
-            title: 'No emergency alerts',
-            detail: 'Active and historical events will appear here.',
-            icon: Icons.emergency_outlined,
-          );
-        return ListView.builder(
-          padding: const EdgeInsets.all(16),
-          itemCount: s.data!.length,
-          itemBuilder: (c, i) {
-            final e = s.data![i];
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: SectionCard(
-                child: ListTile(
-                  leading: const Icon(
-                    Icons.emergency,
-                    color: MedilinkColors.red,
+  Widget build(BuildContext context) => PageFrame(
+    title: 'Emergency',
+    child: Container(
+      color: widget.emergencyId != null ? MedilinkColors.red.withValues(alpha: .06) : null,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.emergency, size: 82, color: MedilinkColors.red),
+            const SizedBox(height: 20),
+            Text(
+              'POTENTIAL EMERGENCY',
+              style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900, color: MedilinkColors.red),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              panicAttackType != null && panicAttackType != 'NONE_DETECTED'
+                  ? 'Possible panic-attack pattern detected. This is decision-support information, not a diagnosis.'
+                  : 'An abnormal health pattern has been detected.',
+              textAlign: TextAlign.center,
+            ),
+            if (widget.emergencyId != null) ...[
+              const SizedBox(height: 20),
+              if (loadingCountdown)
+                const CircularProgressIndicator()
+              else
+                Semantics(
+                  liveRegion: true,
+                  label: 'Confirmation countdown: $seconds seconds remaining',
+                  child: Text(
+                    '$seconds',
+                    style: Theme.of(context).textTheme.displayLarge?.copyWith(fontWeight: FontWeight.w900, color: MedilinkColors.red, fontSize: 72),
                   ),
-                  title: Text('Emergency ${e['id']}'),
-                  subtitle: Text('Patient ${e['patientId']}'),
-                  trailing: StatusBadge(label: e['status'].toString()),
                 ),
+              const Text('seconds to respond', style: TextStyle(fontWeight: FontWeight.w700)),
+            ],
+            const SizedBox(height: 24),
+            PrimaryButton(
+              label: "I'm OK",
+              onPressed: widget.emergencyId == null ? () => Navigator.pop(context) : () => _action('cancel'),
+              loading: busy,
+              icon: Icons.check_circle_outline,
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              height: 54,
+              child: FilledButton.icon(
+                style: FilledButton.styleFrom(backgroundColor: MedilinkColors.red),
+                onPressed: widget.emergencyId == null ? null : () => _action('confirm'),
+                icon: const Icon(Icons.call),
+                label: const Text('I NEED HELP'),
               ),
-            );
-          },
-        );
-      },
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'Caretakers are called/texted from this phone\'s own SIM — keep it on and connected.',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: MedilinkColors.amber),
+              ),
+            ),
+            if (message != null)
+              Padding(padding: const EdgeInsets.only(top: 16), child: Text(message!)),
+            const SizedBox(height: 20),
+            const Text('PRESS AND HOLD FOR SOS', style: TextStyle(fontWeight: FontWeight.w800, color: MedilinkColors.red)),
+          ],
+        ),
+      ),
     ),
   );
+}
+
+class EmergencyList extends ConsumerStatefulWidget {
+  const EmergencyList({super.key});
+  @override
+  ConsumerState<EmergencyList> createState() => _EmergencyListState();
+}
+
+class _EmergencyListState extends ConsumerState<EmergencyList> {
+  RealtimeConnection? _connection;
+  StreamSubscription? _subscription;
+  Future<List<Map<String, dynamic>>>? _future;
+  bool _autoEscalatedOnly = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final role = ref.read(sessionProvider).role;
+    final api = ref.read(apiClientProvider);
+    _future = role == 'HOSPITAL' ? api.activeEmergencies() : api.emergencies(ref.read(sessionProvider).userId);
+    // Hospital command center subscribes to the hospital-wide channel; other roles subscribe
+    // to their own patient channel so a new/updated emergency refreshes the list live.
+    _connection = role == 'HOSPITAL'
+        ? RealtimeService(ref.read(sessionProvider.notifier)).hospitalChannel()
+        : RealtimeService(ref.read(sessionProvider.notifier)).patientChannel(ref.read(sessionProvider).userId);
+    _subscription = _connection!.events.listen((event) {
+      if (mounted && event['event'] == 'emergency.updated') _load();
+    });
+  }
+
+  void _load() {
+    final role = ref.read(sessionProvider).role;
+    final api = ref.read(apiClientProvider);
+    setState(() {
+      _future = role == 'HOSPITAL' ? api.activeEmergencies() : api.emergencies(ref.read(sessionProvider).userId);
+    });
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    _connection?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _acknowledge(String emergencyId) async {
+    try {
+      await ref.read(apiClientProvider).acknowledgeContactAlert(emergencyId);
+      _load();
+    } on ApiException catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final role = ref.read(sessionProvider).role;
+    return PageFrame(
+      title: 'Emergency alerts',
+      child: Column(
+        children: [
+          if (role == 'HOSPITAL')
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: FilterChip(
+                  label: const Text('Auto-escalated only'),
+                  selected: _autoEscalatedOnly,
+                  onSelected: (v) => setState(() => _autoEscalatedOnly = v),
+                ),
+              ),
+            ),
+          Expanded(
+            child: FutureBuilder<List<Map<String, dynamic>>>(
+        future: _future,
+        builder: (c, s) {
+          if (s.connectionState == ConnectionState.waiting) return const LoadingState();
+          if (s.hasError) {
+            return ErrorState(message: s.error.toString(), onRetry: _load);
+          }
+          final data = _autoEscalatedOnly ? s.data!.where((e) => e['autoEscalated'] == true).toList() : s.data!;
+          if (data.isEmpty) {
+            return const EmptyState(
+              title: 'No emergency alerts',
+              detail: 'Active and historical events will appear here.',
+              icon: Icons.emergency_outlined,
+            );
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: data.length,
+            itemBuilder: (c, i) {
+              final e = data[i];
+              final autoEscalated = e['autoEscalated'] == true;
+              final canAcknowledge = role == 'CAREGIVER' &&
+                  e['escalationStage'] == 'CONTACT_NOTIFIED' &&
+                  e['contactAcknowledgedAt'] == null;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: SectionCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          Icons.emergency,
+                          color: autoEscalated ? MedilinkColors.red : MedilinkColors.blue,
+                        ),
+                        title: Row(
+                          children: [
+                            Expanded(child: Text('Emergency ${e['id']}')),
+                            if (autoEscalated) ...[
+                              const Icon(Icons.priority_high, size: 16, color: MedilinkColors.red),
+                              const Text(' AUTO-ESCALATED', style: TextStyle(color: MedilinkColors.red, fontWeight: FontWeight.w800, fontSize: 11)),
+                            ],
+                          ],
+                        ),
+                        subtitle: Text('Patient ${e['patientId']}${e['panicAttackType'] != null && e['panicAttackType'] != 'NONE_DETECTED' ? ' · ${e['panicAttackType']}' : ''}'),
+                        trailing: Wrap(
+                          spacing: 6,
+                          children: [
+                            StatusBadge(label: e['status'].toString()),
+                            if (e['escalationStage'] != null)
+                              EscalationStageBadge(status: e['status'].toString(), escalationStage: e['escalationStage'].toString()),
+                          ],
+                        ),
+                      ),
+                      if (canAcknowledge)
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton.icon(
+                            onPressed: () => _acknowledge(e['id'].toString()),
+                            icon: const Icon(Icons.check_circle_outline),
+                            label: const Text('Acknowledge alert'),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class ConnectionsPage extends StatelessWidget {
@@ -647,6 +1068,15 @@ class ConnectionsPage extends StatelessWidget {
             leading: const Icon(Icons.privacy_tip_outlined),
             title: const Text('Consent'),
             onTap: () => _open(context, const ConsentPage()),
+          ),
+        ),
+        const SizedBox(height: 12),
+        SectionCard(
+          child: ListTile(
+            leading: const Icon(Icons.contact_phone_outlined),
+            title: const Text('Emergency contacts'),
+            subtitle: const Text('Who gets called/texted first in a confirmed emergency'),
+            onTap: () => _open(context, const ContactsPage()),
           ),
         ),
       ],
@@ -729,40 +1159,6 @@ class _HospitalsPageState extends ConsumerState<HospitalsPage> {
   );
 }
 
-class MedicalVaultPage extends ConsumerWidget {
-  const MedicalVaultPage({super.key});
-  @override
-  Widget build(BuildContext context, WidgetRef ref) => PageFrame(
-    title: 'Medical vault',
-    child: FutureBuilder<List<Map<String, dynamic>>>(
-      future: ref.read(apiClientProvider).list('/medical-records'),
-      builder: (c, s) {
-        if (!s.hasData) return const LoadingState();
-        if (s.data!.isEmpty)
-          return const EmptyState(
-            title: 'Your vault is empty',
-            detail: 'Authorized GridFS records appear here.',
-            icon: Icons.folder_open_outlined,
-          );
-        return ListView.builder(
-          padding: const EdgeInsets.all(16),
-          itemCount: s.data!.length,
-          itemBuilder: (c, i) {
-            final r = s.data![i];
-            return SectionCard(
-              child: ListTile(
-                leading: const Icon(Icons.description_outlined),
-                title: Text(r['filename']?.toString() ?? 'Medical record'),
-                subtitle: Text('AI: ${r['summaryStatus'] ?? 'UNAVAILABLE'}'),
-              ),
-            );
-          },
-        );
-      },
-    ),
-  );
-}
-
 class QrPage extends ConsumerStatefulWidget {
   const QrPage({super.key});
   @override
@@ -799,6 +1195,14 @@ class _QrPageState extends ConsumerState<QrPage> {
                 onPressed: _create,
                 child: const Text('Create profile QR'),
               ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const QrScanPage()),
+                ),
+                icon: const Icon(Icons.qr_code_scanner_outlined),
+                label: const Text('Scan someone\'s QR'),
+              ),
             ],
           ),
         ),
@@ -813,65 +1217,357 @@ class _QrPageState extends ConsumerState<QrPage> {
   }
 }
 
-class ConsentPage extends ConsumerWidget {
+class QrScanPage extends ConsumerStatefulWidget {
+  const QrScanPage({super.key});
+  @override
+  ConsumerState<QrScanPage> createState() => _QrScanPageState();
+}
+
+class _QrScanPageState extends ConsumerState<QrScanPage> {
+  bool _handled = false;
+  Map<String, dynamic>? _info;
+  String? _error;
+
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (_handled || capture.barcodes.isEmpty) return;
+    final raw = capture.barcodes.first.rawValue;
+    if (raw == null) return;
+    setState(() => _handled = true);
+    try {
+      final result = await ref.read(apiClientProvider).get('/qr/$raw') as Map;
+      setState(() => _info = Map<String, dynamic>.from(result));
+    } on ApiException catch (e) {
+      setState(() => _error = e.message);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => PageFrame(
+    title: 'Scan QR',
+    child: _info != null
+        ? _PatientInfoResult(info: _info!)
+        : Column(
+            children: [
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(_error!, style: const TextStyle(color: MedilinkColors.red)),
+                ),
+              Expanded(child: MobileScanner(onDetect: _onDetect)),
+            ],
+          ),
+  );
+}
+
+class _PatientInfoResult extends StatelessWidget {
+  const _PatientInfoResult({required this.info});
+  final Map<String, dynamic> info;
+  @override
+  Widget build(BuildContext context) {
+    final patient = info['patient'] as Map?;
+    final contacts = (info['emergencyContacts'] as List?) ?? [];
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        SectionCard(
+          child: ListTile(
+            leading: const CircleAvatar(child: Icon(Icons.person_outline)),
+            title: Text(patient?['name']?.toString() ?? 'Unknown patient'),
+            subtitle: Text([
+              if (patient?['age'] != null) 'Age ${patient!['age']}',
+              if (patient?['phone'] != null) patient!['phone'].toString(),
+            ].join(' · ')),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Text('Emergency contacts', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800)),
+        const SizedBox(height: 8),
+        if (contacts.isEmpty)
+          const Text('No emergency contacts on file.')
+        else
+          ...contacts.map((c) => SectionCard(
+                child: ListTile(
+                  leading: const Icon(Icons.phone_outlined),
+                  title: Text(c['name']?.toString() ?? ''),
+                  subtitle: Text(c['phone']?.toString() ?? ''),
+                ),
+              )),
+      ],
+    );
+  }
+}
+
+class ConsentPage extends ConsumerStatefulWidget {
   const ConsentPage({super.key});
   @override
-  Widget build(BuildContext context, WidgetRef ref) => PageFrame(
-    title: 'Consent',
-    child: FutureBuilder<List<Map<String, dynamic>>>(
-      future: ref.read(apiClientProvider).list('/consents'),
-      builder: (c, s) {
-        if (!s.hasData) return const LoadingState();
-        if (s.data!.isEmpty)
-          return const EmptyState(
-            title: 'No consent requests',
-            detail: 'Medical-data access remains consent based.',
-            icon: Icons.privacy_tip_outlined,
-          );
-        return ListView.builder(
-          padding: const EdgeInsets.all(16),
-          itemCount: s.data!.length,
-          itemBuilder: (c, i) {
-            final x = s.data![i];
-            final scopes = (x['requestedScopes'] as List? ?? []).join(', ');
-            return SectionCard(
-              child: ListTile(
-                title: Text('Requester: ${x['requesterId']}'),
-                subtitle: Text(scopes),
-                trailing: StatusBadge(label: x['status'].toString()),
-              ),
-            );
-          },
-        );
-      },
-    ),
-  );
+  ConsumerState<ConsentPage> createState() => _ConsentPageState();
 }
 
-class PatientConnections extends StatelessWidget {
-  const PatientConnections({super.key});
+class _ConsentPageState extends ConsumerState<ConsentPage> {
+  Future<List<Map<String, dynamic>>>? _future;
+  final Map<String, String> _namesById = {};
+  bool _busy = false;
+
   @override
-  Widget build(BuildContext context) => const PageFrame(
-    title: 'Patients',
-    child: EmptyState(
-      title: 'No patient connection selected',
-      detail: 'Consent-approved patient records will appear here.',
-      icon: Icons.groups_outlined,
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchConsents() async {
+    final api = ref.read(apiClientProvider);
+    final role = ref.read(sessionProvider).role;
+    final consents = await api.list('/consents');
+    for (final c in consents) {
+      final otherId = (role == 'PATIENT' ? c['requesterId'] : c['patientId'])?.toString();
+      if (otherId != null && !_namesById.containsKey(otherId)) {
+        try {
+          final user = await api.get('/users/$otherId') as Map?;
+          if (user != null) _namesById[otherId] = user['name']?.toString() ?? otherId;
+        } catch (_) {
+          _namesById[otherId] = otherId;
+        }
+      }
+    }
+    return consents;
+  }
+
+  void _load() => setState(() => _future = _fetchConsents());
+
+  Future<void> _respond(String consentId, String action) async {
+    setState(() => _busy = true);
+    try {
+      await ref.read(apiClientProvider).post('/consents/$consentId/$action');
+      _load();
+    } on ApiException catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _connectToPatient() async {
+    final role = ref.read(sessionProvider).role;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => _ConnectDialog(role: role),
+    );
+    if (result != null && mounted) {
+      _load();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final role = ref.read(sessionProvider).role;
+    return PageFrame(
+      title: 'Consent',
+      actions: role != 'PATIENT'
+          ? [IconButton(icon: const Icon(Icons.person_add_alt_outlined), onPressed: _connectToPatient)]
+          : const [],
+      child: FutureBuilder<List<Map<String, dynamic>>>(
+        future: _future,
+        builder: (c, s) {
+          if (s.connectionState == ConnectionState.waiting) return const LoadingState();
+          if (!s.hasData || s.data!.isEmpty) {
+            return EmptyState(
+              title: 'No consent requests',
+              detail: role == 'PATIENT'
+                  ? 'When a doctor or caregiver requests access, it will show up here to grant or reject.'
+                  : 'Tap the + icon above to request access to a patient by their email or phone.',
+              icon: Icons.privacy_tip_outlined,
+            );
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: s.data!.length,
+            itemBuilder: (c, i) {
+              final x = s.data![i];
+              final scopes = (x['requestedScopes'] as List? ?? []).join(', ');
+              final otherId = (role == 'PATIENT' ? x['requesterId'] : x['patientId'])?.toString();
+              final otherName = _namesById[otherId] ?? otherId ?? 'Unknown';
+              final isPatientAndPending = role == 'PATIENT' && x['status'] == 'REQUESTED';
+              return SectionCard(
+                child: ListTile(
+                  title: Text(otherName),
+                  subtitle: Text(scopes.isEmpty ? (x['purpose']?.toString() ?? '') : scopes),
+                  trailing: isPatientAndPending
+                      ? Wrap(spacing: 8, children: [
+                          TextButton(
+                            onPressed: _busy ? null : () => _respond(x['id'].toString(), 'reject'),
+                            child: const Text('Reject'),
+                          ),
+                          PrimaryButton(
+                            label: 'Grant',
+                            loading: _busy,
+                            onPressed: () => _respond(x['id'].toString(), 'grant'),
+                          ),
+                        ])
+                      : StatusBadge(label: x['status'].toString()),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _ConnectDialog extends ConsumerStatefulWidget {
+  const _ConnectDialog({required this.role});
+  final String role;
+  @override
+  ConsumerState<_ConnectDialog> createState() => _ConnectDialogState();
+}
+
+class _ConnectDialogState extends ConsumerState<_ConnectDialog> {
+  final _identifier = TextEditingController();
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _submit() async {
+    final value = _identifier.text.trim();
+    if (value.isEmpty) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final api = ref.read(apiClientProvider);
+      final matches = await api.list('/users/search', query: {'identifier': value, 'role': 'PATIENT'});
+      if (matches.isEmpty) {
+        setState(() => _error = 'No patient found with that email or phone.');
+        return;
+      }
+      final patient = matches.first;
+      final myId = ref.read(sessionProvider).userId;
+      await api.post('/consents/request', body: {
+        'patientId': patient['id'],
+        'requesterId': myId,
+        'requestedScopes': ['VITALS', 'RECORDS'],
+        'purpose': 'Care coordination request',
+      });
+      if (mounted) Navigator.of(context).pop('Request sent to ${patient['name']}. They must grant it before you see their data.');
+    } on ApiException catch (e) {
+      setState(() => _error = e.message);
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Connect with a patient'),
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Enter the patient\'s registered email or phone number.'),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _identifier,
+          decoration: const InputDecoration(labelText: 'Email or phone number'),
+        ),
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(_error!, style: const TextStyle(color: MedilinkColors.red)),
+          ),
+      ],
     ),
+    actions: [
+      TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
+      PrimaryButton(label: 'Send request', loading: _loading, onPressed: _submit),
+    ],
   );
 }
 
-class ChatPage extends StatelessWidget {
+class ChatPage extends ConsumerStatefulWidget {
   const ChatPage({super.key});
   @override
-  Widget build(BuildContext context) => const PageFrame(
-    title: 'Messages',
-    child: EmptyState(
-      title: 'Select a conversation',
-      detail: 'Messages are backed by the MEDILINK message API.',
-      icon: Icons.chat_bubble_outline,
-    ),
-  );
+  ConsumerState<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends ConsumerState<ChatPage> {
+  Future<List<Map<String, dynamic>>>? _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchContacts() async {
+    final api = ref.read(apiClientProvider);
+    final myId = ref.read(sessionProvider).userId;
+    final role = ref.read(sessionProvider).role;
+    final consents = await api.list('/consents');
+    // Patients see their connected clinicians/caregivers; Doctors/Caregivers see their patients.
+    final relevant = role == 'PATIENT'
+        ? consents.where((c) => c['status'] == 'GRANTED' && c['patientId'] == myId)
+        : consents.where((c) => c['status'] == 'GRANTED' && c['requesterId'] == myId);
+    final otherPartyIds = relevant.map((c) => role == 'PATIENT' ? c['requesterId'] : c['patientId']).toSet();
+    final contacts = <Map<String, dynamic>>[];
+    for (final id in otherPartyIds) {
+      try {
+        final user = await api.get('/users/$id') as Map?;
+        if (user != null) contacts.add(Map<String, dynamic>.from(user));
+      } catch (_) {}
+    }
+    return contacts;
+  }
+
+  void _load() => setState(() => _future = _fetchContacts());
+
+  @override
+  Widget build(BuildContext context) {
+    final myId = ref.read(sessionProvider).userId;
+    return PageFrame(
+      title: 'Messages',
+      child: FutureBuilder<List<Map<String, dynamic>>>(
+        future: _future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) return const LoadingState();
+          if (snapshot.hasError) return ErrorState(message: snapshot.error.toString(), onRetry: _load);
+          final contacts = snapshot.data!;
+          if (contacts.isEmpty) {
+            return const EmptyState(
+              title: 'No conversations yet',
+              detail: 'Once you have a granted consent connection, you can message them here.',
+              icon: Icons.chat_bubble_outline,
+            );
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: contacts.length,
+            itemBuilder: (context, i) {
+              final contact = contacts[i];
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: SectionCard(
+                  child: ListTile(
+                    leading: const CircleAvatar(child: Icon(Icons.person_outline)),
+                    title: Text(contact['name']?.toString() ?? 'Contact'),
+                    subtitle: Text(contact['role']?.toString() ?? ''),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => ConversationPage(
+                        conversationId: conversationIdFor(myId, contact['id'].toString()),
+                        otherPartyId: contact['id'].toString(),
+                        title: contact['name']?.toString() ?? 'Conversation',
+                      ),
+                    )),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
 }
 
 class NotificationsPage extends ConsumerWidget {
@@ -926,6 +1622,27 @@ class ProfilePage extends ConsumerWidget {
               title: const Text('Senior Mode'),
             ),
           ),
+          const SizedBox(height: 16),
+          SectionCard(
+            child: SwitchListTile(
+              value: ref.watch(sessionProvider).devModeEnabled,
+              onChanged: (v) =>
+                  ref.read(sessionProvider.notifier).setDevMode(v),
+              title: const Text('Dev Mode'),
+              subtitle: const Text(
+                'Reveals the vitals simulator for testing. Simulated readings are always labeled DEV/SIMULATED and never replace real BLE data.',
+              ),
+            ),
+          ),
+          if (ref.watch(sessionProvider).devModeEnabled) ...[
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(foregroundColor: MedilinkColors.red),
+              onPressed: () => CrashReporting.forceTestCrash(),
+              icon: const Icon(Icons.bug_report_outlined),
+              label: const Text('Force test crash (Crashlytics)'),
+            ),
+          ],
           const SizedBox(height: 20),
           OutlinedButton.icon(
             onPressed: () async {

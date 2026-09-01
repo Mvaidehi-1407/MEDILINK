@@ -38,10 +38,21 @@ class MedilinkApp extends ConsumerWidget {
             borderRadius: BorderRadius.all(Radius.circular(8)),
           ),
         ),
-        textTheme: ThemeData.light().textTheme.apply(
-          fontSizeFactor: seniorMode ? 1.18 : 1,
-        ),
       ),
+      // Senior Mode text scaling via MediaQuery/TextScaler (the modern, null-safe approach) --
+      // TextTheme.apply(fontSizeFactor: ...) is unsafe here because Material 3's base text
+      // theme can contain styles with fontSize: null, which .apply() cannot scale.
+      builder: (context, child) {
+        final mediaQuery = MediaQuery.of(context);
+        return MediaQuery(
+          data: mediaQuery.copyWith(
+            // Layer Senior Mode on top of whatever the device's own accessibility text-scale
+            // setting already is, rather than clobbering it.
+            textScaler: seniorMode ? mediaQuery.textScaler.clamp(minScaleFactor: 1.18) : mediaQuery.textScaler,
+          ),
+          child: child!,
+        );
+      },
       routerConfig: appRouter,
     );
   }

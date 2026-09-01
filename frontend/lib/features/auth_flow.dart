@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../core/api_client.dart';
+import '../core/fcm_service.dart';
 import '../core/session.dart';
 import '../widgets/common.dart';
 
@@ -208,18 +211,34 @@ class AuthPage extends ConsumerStatefulWidget {
 class _AuthPageState extends ConsumerState<AuthPage> {
   final _form = GlobalKey<FormState>();
   final _name = TextEditingController();
+  final _phone = TextEditingController();
   final _email = TextEditingController();
   final _password = TextEditingController();
   final _confirm = TextEditingController();
+  final _identifier = TextEditingController();
+  final _care1Name = TextEditingController();
+  final _care1Phone = TextEditingController();
+  final _care2Name = TextEditingController();
+  final _care2Phone = TextEditingController();
+  final _care3Name = TextEditingController();
+  final _care3Phone = TextEditingController();
   String _role = 'PATIENT';
   bool _loading = false;
   String? _error;
   @override
   void dispose() {
     _name.dispose();
+    _phone.dispose();
     _email.dispose();
     _password.dispose();
     _confirm.dispose();
+    _identifier.dispose();
+    _care1Name.dispose();
+    _care1Phone.dispose();
+    _care2Name.dispose();
+    _care2Phone.dispose();
+    _care3Name.dispose();
+    _care3Phone.dispose();
     super.dispose();
   }
 
@@ -257,8 +276,17 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                 onChanged: (v) => setState(() => _role = v!),
               ),
               const SizedBox(height: 16),
+              _phoneField(
+                _phone,
+                'Phone number (+countrycode...)',
+                helperText: 'Used to log in and shared with doctors/caregivers you connect with.',
+              ),
+              const SizedBox(height: 16),
             ],
-            _field(_email, 'Email address', Icons.email_outlined),
+            if (widget.login)
+              _field(_identifier, 'Email or phone number', Icons.person_outline)
+            else
+              _field(_email, 'Email address', Icons.email_outlined),
             const SizedBox(height: 16),
             _field(_password, 'Password', Icons.lock_outline, obscure: true),
             if (!widget.login) ...[
@@ -269,6 +297,24 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                 Icons.lock_outline,
                 obscure: true,
               ),
+              if (_role == 'PATIENT') ...[
+                const SizedBox(height: 24),
+                Text(
+                  'Emergency caretakers',
+                  style: Theme.of(context).textTheme.titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Add 3 people to contact, in order, if we can\'t reach you during an emergency.',
+                ),
+                const SizedBox(height: 12),
+                _caretakerFields(1, _care1Name, _care1Phone),
+                const SizedBox(height: 12),
+                _caretakerFields(2, _care2Name, _care2Phone),
+                const SizedBox(height: 12),
+                _caretakerFields(3, _care3Name, _care3Phone),
+              ],
             ],
             if (_error != null)
               Padding(
@@ -321,6 +367,38 @@ class _AuthPageState extends ConsumerState<AuthPage> {
       return null;
     },
   );
+  Widget _phoneField(TextEditingController c, String label, {String? helperText}) =>
+      TextFormField(
+        controller: c,
+        keyboardType: TextInputType.phone,
+        decoration: InputDecoration(
+          labelText: label,
+          prefixIcon: const Icon(Icons.phone_outlined),
+          helperText: helperText,
+        ),
+        validator: (v) {
+          if (v == null || v.trim().isEmpty) return 'Phone number is required';
+          if (!RegExp(r'^\+[1-9]\d{7,14}$').hasMatch(v.trim())) {
+            return 'Use E.164 format, e.g. +919876543210';
+          }
+          return null;
+        },
+      );
+  Widget _caretakerFields(int index, TextEditingController name, TextEditingController phone) =>
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Caretaker $index', style: Theme.of(context).textTheme.labelLarge),
+          const SizedBox(height: 6),
+          TextFormField(
+            controller: name,
+            decoration: const InputDecoration(labelText: 'Name', prefixIcon: Icon(Icons.person_outline)),
+            validator: (v) => (v == null || v.trim().isEmpty) ? 'Caretaker name is required' : null,
+          ),
+          const SizedBox(height: 8),
+          _phoneField(phone, 'Phone number'),
+        ],
+      );
   Future<void> _submit() async {
     if (!_form.currentState!.validate()) return;
     setState(() {
@@ -330,14 +408,23 @@ class _AuthPageState extends ConsumerState<AuthPage> {
     try {
       final api = ref.read(apiClientProvider);
       final payload = widget.login
-          ? await api.login(_email.text.trim(), _password.text)
+          ? await api.login(_identifier.text.trim(), _password.text)
           : await api.register(
               name: _name.text.trim(),
               email: _email.text.trim(),
               password: _password.text,
               role: _role,
+              phone: _phone.text.trim(),
+              caretakers: _role == 'PATIENT'
+                  ? [
+                      {'name': _care1Name.text.trim(), 'phone': _care1Phone.text.trim()},
+                      {'name': _care2Name.text.trim(), 'phone': _care2Phone.text.trim()},
+                      {'name': _care3Name.text.trim(), 'phone': _care3Phone.text.trim()},
+                    ]
+                  : null,
             );
       await ref.read(sessionProvider.notifier).saveAuth(payload);
+      unawaited(FcmService(ref.read(apiClientProvider)).initializeAndRegister());
       if (mounted) context.go(widget.login ? '/app' : '/permissions');
     } on ApiException catch (e) {
       if (mounted) setState(() => _error = e.message);

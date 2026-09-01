@@ -1,0 +1,161 @@
+# MediLink Patch — PART 1 of 3: Build Fix, Security, Vital Simulator & AI/LLM Intelligence
+
+> This is Part 1 of a 3-part sequential patch plan. Complete and verify every exit criterion in this part before starting Part 2 — later parts depend on the security fixes, simulator, and risk/report engines built here.
+
+## Operating Constraints (apply to everything below)
+
+- **Patch, don't rebuild.** All work modifies the existing MediLink codebase in place. No parallel demo app, no throwaway prototype.
+- **No fake fallbacks except the explicit simulator.** Every other "demo mode" branch must be removed, not hidden.
+- **Definition of done = verified end-to-end.** A feature is not "implemented" because the code exists and compiles — it's implemented when you've run it live and watched real data move through every hop. Do not report a phase complete without evidence (logs, screenshots, or a recorded test run).
+
+## Current State (for context)
+
+```
+Overall: 70% | Frontend: 74% | Backend: 82% | API: 78% | Android: 60% | UI/UX: 70% | SIH readiness: 58%
+
+Verified: registration, login, JWT+refresh, role routing (4 roles), Atlas
+connectivity, Patient dashboard, API routes registered.
+
+Not verified: current source build via `flutter run`, real BLE, real FCM,
+real calls, frontend WebSocket wiring, non-auth endpoints end-to-end,
+Doctor/Caregiver/Hospital dashboards.
+
+Defects to remove: hard-coded offline banner, static AI insight, empty role
+dashboards, wildcard CORS, JWT secret fallback, bcrypt warning, WS JWT in
+query string, no token revocation, no rate limiting.
+```
+
+---
+
+## PHASE 0 — Unblock & Verify Build (P0)
+
+- `flutter clean && flutter pub get && flutter run` from current source on a **real device** — confirm it's not silently serving a stale APK.
+- Resolve any emulator/tooling lock issues encountered.
+
+**Exit criterion:** app launches from source, onboarding → login reachable.
+
+---
+
+## PHASE 1 — Security Hardening (P0)
+
+- Remove the JWT secret fallback (`change-me-in-env`) — hard-fail startup if `.env` doesn't load.
+- Replace wildcard CORS with an explicit origin allow-list.
+- Move WebSocket JWT out of the query string (initial WS message payload or short-lived signed ticket).
+- Add refresh-token revocation/rotation on logout.
+- Add rate limiting on `/api/auth/login` and `/api/auth/register`.
+- Fix the bcrypt/passlib version warning.
+
+**Exit criterion:** no default secrets, no wildcard CORS, WS auth off the URL, revocation working, rate limiting confirmed with a repeated-failure test.
+
+---
+
+## PHASE 2 — Vital Simulator as Interim Data Source (Dev Mode only)
+
+- Build a **realistic** vitals generator (plausible HR/SpO2/etc. ranges with natural variation and occasional threshold-breaching spikes — not flat/random noise).
+- Simulator output must be pushed through **the exact same ingestion path** a real BLE reading would use: same payload schema, same `/api/health` endpoint, same validation, same downstream processing.
+- Clearly label it **"DEV/SIMULATED"** in the UI wherever its data appears, tied to a `source: "simulator"` field on the reading — not just a UI comment.
+- Gate entirely behind an explicit Dev Mode toggle — never active by default, never silently substituted if real BLE fails.
+- **Design check:** confirm swapping in real BLE later requires changing only the data-source component, zero backend/schema changes. If any backend change would be required, fix the decoupling before continuing.
+
+**Exit criterion:** simulator readings flow through `/api/health` identically to a real BLE reading would, visibly labeled DEV/SIMULATED end-to-end.
+
+---
+
+## PHASE 3 — Hybrid AI Risk Engine
+
+**Pipeline:** `Vitals → preprocessing → trained ML model → risk prediction`, with the existing rule-based engine as a **mandatory** fallback.
+
+**Preprocessing:** normalize/clean incoming vitals, handle missing fields/out-of-range values/type mismatches before they reach the model. Invalid input routes straight to rule-based fallback — never forced into ML.
+
+**Model:** lightweight, fast-inference (e.g. scikit-learn logistic regression or gradient-boosted trees), trained offline on a realistic vitals dataset (public/synthetic acceptable for SIH scope — document the source honestly). Serialized with `joblib`/`pickle`, loaded once at startup. Wrap every inference call with an explicit timeout (e.g. `asyncio.wait_for`, 2s).
+
+**Fallback logic (automatic, no manual intervention):**
+```
+ML inference attempt
+  → succeeds within timeout, valid output  → use ML result
+  → fails / unavailable / times out / invalid input → RULE_FALLBACK
+Either path → emergency workflow continues unaffected
+```
+
+**Storage — extend the reading/risk record:**
+
+| Field | Purpose |
+|---|---|
+| `risk_score` | Numeric or categorical risk output |
+| `confidence` | Model confidence (ML) or fixed value for rule-based |
+| `engine_used` | `"ML"` or `"RULE_FALLBACK"` — literal, queryable |
+| `timestamp` | When classification ran |
+| `model_version` | Version string of loaded model artifact |
+
+**Testing (mandatory):**
+- [ ] Valid vitals → ML result stored with `engine_used: "ML"`
+- [ ] Forced ML failure (kill model file / invalid input / simulated timeout) → automatic fallback fires, `engine_used: "RULE_FALLBACK"`, workflow uninterrupted
+- [ ] `model_version` and `confidence` populated correctly in both paths
+
+**Exit criterion:** both paths observed live with correctly stored fields; emergency escalation proven unaffected by which path fired.
+
+---
+
+## PHASE 4 — LLM-Powered Report Generation
+
+**Purpose:** replace any static/hardcoded report text with real, data-grounded clinical summaries — used for Doctor patient-summary reports and post-emergency incident reports (Hospital/Caregiver-facing).
+
+**Pipeline:**
+```
+Structured patient data (readings history, risk-engine outputs incl.
+engine_used/confidence, emergency timeline, location, actions taken)
+        ↓
+Assembled into a structured context object
+        ↓
+Sent to LLM with a fixed system prompt
+        ↓
+Formatted report text returned → stored → displayed
+```
+
+**System prompt (use as the base, refine wording as needed):**
+```
+You are a clinical reporting assistant for MediLink. You generate factual,
+structured summaries from the patient data provided to you. Rules:
+
+1. Use ONLY the data provided in this request. Never infer, invent, or
+   assume any vital sign, event, or outcome not explicitly present.
+2. Structure every report with these sections: Summary, Key Events
+   Timeline, Risk Assessment, Recommended Next Steps.
+3. In the Risk Assessment section, explicitly state whether each risk
+   classification was produced by the ML model or the rule-based fallback,
+   using the engine_used field provided.
+4. You do NOT provide a medical diagnosis or prescribe treatment. Frame
+   all output as a data summary for a licensed clinician to review, not
+   as clinical advice.
+5. Keep tone factual and concise. No speculation, no reassurance language,
+   no filler.
+```
+
+**Fallback (mandatory, mirrors Phase 3):** if the LLM call fails, times out, or is unavailable, fall back to a **template-based** report — the same structured sections filled in programmatically from the same data, no free-text generation. Never block report delivery.
+
+**Storage:** report text, `report_generator` (`"LLM"` / `"TEMPLATE_FALLBACK"`), `timestamp`, `llm_model_version`.
+
+**Testing (mandatory):**
+- [ ] Real LLM success case → report stored with `report_generator: "LLM"`, correctly reflects `engine_used` values from the underlying readings
+- [ ] Forced LLM failure (invalid key, timeout, service down) → automatic template fallback fires, `report_generator: "TEMPLATE_FALLBACK"`, report still delivered
+- [ ] Confirm the system prompt's no-diagnosis constraint holds — spot-check output for any advice/diagnosis language and tighten the prompt if it appears
+
+**Exit criterion:** both paths observed live producing a complete, correctly-labeled report from real patient data.
+
+---
+
+## Regression Checklist for This Part
+
+- [ ] `flutter clean && flutter pub get && flutter run` succeeds from source on a real device
+- [ ] Backend boots clean, no fallback-secret or bcrypt warnings
+- [ ] CORS rejects an unlisted origin
+- [ ] Missing `.env` hard-fails startup
+- [ ] Login/register rate-limits after repeated failures
+- [ ] WebSocket connects without a token in the URL
+- [ ] Real BLE-shaped simulator data flows through `/api/health` unchanged from what real BLE would send
+- [ ] ML success path and forced-fallback path both confirmed with correct `engine_used`/`confidence`/`model_version`
+- [ ] LLM report success path and forced-fallback path both confirmed with correct `report_generator`/`llm_model_version`
+
+## What to Hand Back Before Moving to Part 2
+
+A short status note covering: what changed in Phases 0–4, the Phase 3 test results (ML success + forced fallback), the Phase 4 test results (LLM success + forced template fallback), and evidence (logs/screenshots) for each exit criterion above.

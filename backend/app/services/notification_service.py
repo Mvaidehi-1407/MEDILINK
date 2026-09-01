@@ -10,7 +10,7 @@ from app.utils.time import utcnow
 class NotificationService:
     def __init__(self, db: AsyncIOMotorDatabase, provider: NotificationProvider | None = None):
         self.repo = MongoRepository(db, "notifications")
-        self.provider = provider or get_notification_provider()
+        self.provider = provider or get_notification_provider(db=db)
 
     async def notify_user(self, user_id: str, title: str, body: str, data: Dict[str, Any]) -> Dict[str, Any]:
         provider_result = await self.provider.send(user_id, title, body, data)

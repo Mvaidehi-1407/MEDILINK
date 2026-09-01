@@ -1,0 +1,83 @@
+# MediLink Patch — PART 2 of 3: Emergency Pipeline, GPS, Persistence, Push, Calling & WebSockets
+
+> This is Part 2 of a 3-part sequential patch plan. **Depends on Part 1 being complete** — the risk engine (Phase 3) must already be live and stored, since emergency creation here triggers off its output. Complete and verify every exit criterion in this part before starting Part 3.
+
+## Operating Constraints (apply to everything below)
+
+- **Patch, don't rebuild.** All work modifies the existing MediLink codebase in place. No parallel demo app, no throwaway prototype.
+- **No fake fallbacks except the explicit Phase 2 Vital Simulator** (built in Part 1). Every other "demo mode" branch must be removed, not hidden.
+- **Definition of done = verified end-to-end.** A feature is not "implemented" because the code exists and compiles — it's implemented when you've run it live and watched real data move through every hop. Do not report a phase complete without evidence (logs, screenshots, or a recorded test run).
+
+## Context Carried From Part 1
+
+By this point the app should build from source, security hardening (JWT/CORS/WS-auth/rate-limiting) is in place, the Dev Mode vital simulator pushes realistic readings through `/api/health`, and the hybrid ML + rule-based risk engine is live and storing `risk_score`, `confidence`, `engine_used`, `model_version` on every reading. This part wires that risk output into a real, persisted emergency workflow with real location, real notifications, real calls/SMS, and real live updates.
+
+---
+
+## PHASE 5 — Real Emergency Detection + State Machine
+
+- Emergency creation triggered by the risk engine's output (either path from Phase 3) crossing threshold — confirm live wiring, not a separate hardcoded check.
+- State transitions (`pending_confirmation → active/cancelled → resolved`) persist to MongoDB at every step, not just in-memory.
+
+**Exit criterion:** a real threshold-breaching reading creates a persisted emergency record and progresses through all real states.
+
+---
+
+## PHASE 6 — Real Device GPS
+
+- `geolocator.getCurrentPosition()` on confirm, real coordinates sent to backend, reverse-geocoded via Nominatim, attached to the emergency record.
+- No mocked/hardcoded coordinates anywhere in this path.
+
+**Exit criterion:** a real emergency record contains real captured coordinates and a real reverse-geocoded address.
+
+---
+
+## PHASE 7 — Real MongoDB Persistence (audit pass)
+
+- Go collection by collection (`users`, `readings`, `emergencies`, `messages`, `hospitals`, `consents`, `notifications`) and confirm each write path actually persists — no leftover in-memory stand-ins.
+
+**Exit criterion:** every collection confirmed to survive a backend restart.
+
+---
+
+## PHASE 8 — Real FCM Push Notifications
+
+- Real device token registration on login, real Admin SDK `send()` calls, `onTokenRefresh` handling.
+- Test delivery to both backgrounded and fully killed app states.
+
+**Exit criterion:** a real push notification is received on a physical device in both app states.
+
+---
+
+## PHASE 9 — Real Calling / SMS (Exotel/Plivo, sandbox-verified)
+
+- Verify the demo caregiver's real number in the provider dashboard before any test.
+- Replace the demo fallback with real API calls using the trial SID/token from `.env`.
+- Implement both a real voice-call trigger and a real SMS trigger (SMS is the more demo-reliable of the two).
+- Add `CALL_PROVIDER_MODE=trial` so the UI honestly states "sandbox — verified numbers only" rather than implying unlimited reach.
+
+**Exit criterion:** triggering an emergency causes the verified phone to genuinely ring / receive a real SMS.
+
+---
+
+## PHASE 10 — Real WebSocket Updates + Reconnection
+
+- Frontend connects to the existing patient/conversation/hospital WS endpoints (currently backend-only).
+- Explicit reconnect logic for background/foreground transitions and dropped connections — don't assume the socket stays open.
+
+**Exit criterion:** a live update reaches a subscribed client with no manual refresh, and reconnects automatically after a forced disconnect.
+
+---
+
+## Regression Checklist for This Part
+
+- [ ] A real threshold-breaching reading creates a persisted emergency and moves through all real states
+- [ ] Real GPS + reverse-geocode confirmed in the emergency record, no mocked coordinates
+- [ ] All 7 MongoDB collections (`users`, `readings`, `emergencies`, `messages`, `hospitals`, `consents`, `notifications`) confirmed to survive a backend restart
+- [ ] Real FCM delivered to backgrounded and killed app states
+- [ ] Real call/SMS confirmed to the verified sandbox number, `CALL_PROVIDER_MODE=trial` honestly reflected in UI
+- [ ] WebSocket delivers a live update with no manual refresh, and reconnects automatically after a forced disconnect
+
+## What to Hand Back Before Moving to Part 3
+
+A short status note covering: what changed in Phases 5–10, evidence (logs/screenshots) for each exit criterion above, and confirmation that emergency creation is genuinely driven by live risk-engine output rather than a hardcoded trigger.

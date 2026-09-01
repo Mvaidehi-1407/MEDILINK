@@ -25,3 +25,7 @@ ios/Pods/
 .DS_Store
 
 frontend/assets/android/
+frontend/android/key.properties
+frontend/android/google-services.json
+*.jks
+*.keystore
