@@ -41,7 +41,7 @@ class _ConversationPageState extends ConsumerState<ConversationPage> {
   void initState() {
     super.initState();
     _load();
-    _connection = RealtimeService(ref.read(sessionProvider.notifier)).conversationChannel(widget.conversationId);
+    _connection = RealtimeService(ref.read(sessionProvider.notifier), ref.read(apiClientProvider)).conversationChannel(widget.conversationId);
     _subscription = _connection!.events.listen((event) {
       if (!mounted) return;
       if (event['event'] == 'chat.message') {

@@ -4,19 +4,27 @@ import 'dart:convert';
 import 'package:flutter/widgets.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'api_client.dart';
 import 'session.dart';
 
 /// A self-healing WebSocket connection to one MEDILINK realtime channel. Reconnects
 /// automatically with exponential backoff on any drop (network blip, server restart, forced
 /// disconnect) and also reconnects immediately when the app returns to the foreground, since a
 /// backgrounded app's socket is not assumed to still be open.
+///
+/// The access token is short-lived (30 min by default). Unlike REST calls, this connection only
+/// authenticates once at connect time and has no way to react to a 401 mid-stream -- so every
+/// (re)connect attempt first ensures a fresh token via the same refresh flow the REST client
+/// uses, rather than silently failing to auth over and over with a stale one (which looks
+/// identical to a network problem from the outside: connect, then an immediate server-side close).
 class RealtimeConnection with WidgetsBindingObserver {
-  RealtimeConnection(this._session, this._path) {
+  RealtimeConnection(this._session, this._api, this._path) {
     WidgetsBinding.instance.addObserver(this);
     _connect();
   }
 
   final SessionController _session;
+  final ApiClient _api;
   final String _path;
   final _controller = StreamController<Map<String, dynamic>>.broadcast();
   WebSocketChannel? _channel;
@@ -37,7 +45,13 @@ class RealtimeConnection with WidgetsBindingObserver {
     defaultValue: 'http://10.0.2.2:8000/api',
   );
 
-  void _connect() {
+  Future<void> _connect() async {
+    if (_disposed) return;
+    if (_session.refreshToken != null) {
+      // Best-effort: if the current access token still has life left the backend just accepts
+      // it as-is; if not, this replaces it before we try to authenticate the socket.
+      await _api.refreshTokens();
+    }
     if (_disposed) return;
     final token = _session.accessToken;
     if (token == null) return;
@@ -107,10 +121,11 @@ class RealtimeConnection with WidgetsBindingObserver {
 }
 
 class RealtimeService {
-  RealtimeService(this._session);
+  RealtimeService(this._session, this._api);
   final SessionController _session;
+  final ApiClient _api;
 
-  RealtimeConnection patientChannel(String patientId) => RealtimeConnection(_session, '/ws/patient/$patientId');
-  RealtimeConnection hospitalChannel() => RealtimeConnection(_session, '/ws/hospitals');
-  RealtimeConnection conversationChannel(String conversationId) => RealtimeConnection(_session, '/ws/conversations/$conversationId');
+  RealtimeConnection patientChannel(String patientId) => RealtimeConnection(_session, _api, '/ws/patient/$patientId');
+  RealtimeConnection hospitalChannel() => RealtimeConnection(_session, _api, '/ws/hospitals');
+  RealtimeConnection conversationChannel(String conversationId) => RealtimeConnection(_session, _api, '/ws/conversations/$conversationId');
 }

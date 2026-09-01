@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     # Phase 20: motion-aware supervision mode & tiered escalation timing (all configurable,
     # never hardcoded inline in the routing logic).
     supervision_timeout_minutes: int = 7
-    patient_confirmation_seconds: int = 45
+    patient_confirmation_seconds: int = 10
     contact_ack_window_minutes: int = 5
     escalation_sweep_interval_seconds: int = 20
     # How often the 3-caretaker priority loop advances to the next contact (wrapping back to

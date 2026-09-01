@@ -87,6 +87,11 @@ class ApiClient {
     }
   }
 
+  /// Public entry point for callers outside the normal request/401 flow (e.g. the WebSocket
+  /// connection, which authenticates once at connect time and has no way to react to a 401
+  /// itself) to proactively ensure a fresh access token before they need one.
+  Future<bool> refreshTokens() => _refreshTokens();
+
   Future<Map<String, dynamic>> login(String identifier, String password) async =>
       Map<String, dynamic>.from(
         await post('/auth/login', body: {'identifier': identifier, 'password': password})
