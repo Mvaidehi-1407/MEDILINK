@@ -20,19 +20,25 @@ class ConnectionManager:
     def disconnect(self, channel: str, websocket: WebSocket) -> None:
         self.active[channel].discard(websocket)
 
-    async def broadcast(self, channel: str, event: str, payload: Any) -> None:
+    def is_connected(self, channel: str) -> bool:
+        return len(self.active[channel]) > 0
+
+    async def broadcast(self, channel: str, event: str, payload: Any) -> int:
         # jsonable_encoder handles datetime/ObjectId/etc in payloads that came straight from a
         # Mongo document -- send_json()'s default json.dumps cannot, and would otherwise fail
         # silently (caught below) and quietly drop the client from the channel.
         message = jsonable_encoder({"event": event, "data": payload})
         disconnected: list[WebSocket] = []
+        delivered = 0
         for ws in list(self.active[channel]):
             try:
                 await ws.send_json(message)
+                delivered += 1
             except Exception:
                 disconnected.append(ws)
         for ws in disconnected:
             self.disconnect(channel, ws)
+        return delivered
 
 
 manager = ConnectionManager()

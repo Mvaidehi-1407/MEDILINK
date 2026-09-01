@@ -186,6 +186,11 @@ class ApiClient {
       Map<String, dynamic>.from(await post('/emergencies/$emergencyId/acknowledge-contact') as Map);
   Future<Map<String, dynamic>> getEmergency(String id) async =>
       Map<String, dynamic>.from(await get('/emergencies/$id') as Map);
+  Future<Map<String, dynamic>> createManualSos(String patientId) async =>
+      Map<String, dynamic>.from(await post('/emergencies', body: {
+        'patientId': patientId,
+        'trigger': 'MANUAL_SOS',
+      }) as Map);
 
   // ---- Medical records: real upload/list/download/delete against GridFS -------------------
   Future<List<Map<String, dynamic>>> medicalRecords({String? patientId}) =>

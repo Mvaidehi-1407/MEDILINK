@@ -723,6 +723,11 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
   String? message;
   String? callProviderMode;
   String? panicAttackType;
+  Timer? sosHoldTimer;
+  double sosHoldProgress = 0;
+  bool sosSending = false;
+  bool resolved = false;
+  static const _sosHoldDuration = Duration(milliseconds: 1800);
 
   @override
   void initState() {
@@ -744,6 +749,13 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
     try {
       final emergency = await ref.read(apiClientProvider).getEmergency(widget.emergencyId!);
       panicAttackType = emergency['panicAttackType']?.toString();
+      // If this screen is opened on an emergency that already moved past VERIFICATION (e.g. a
+      // stale deep link, or reopening after the fact), don't start a countdown that would try
+      // an invalid transition -- just show the resolved state.
+      if (emergency['status'] != 'VERIFICATION') {
+        resolved = true;
+        message = 'Emergency status: ${emergency['status']}';
+      }
       final timeline = (emergency['timeline'] as List?) ?? const [];
       final verificationEvent = timeline.lastWhere(
         (e) => e is Map && e['event'] == 'VERIFICATION',
@@ -760,6 +772,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       // runs rather than stalling the patient-confirmation flow.
     }
     if (mounted) setState(() => loadingCountdown = false);
+    if (resolved) return;
     timer = Timer.periodic(const Duration(seconds: 1), (value) {
       if (seconds == 0) {
         value.cancel();
@@ -774,11 +787,56 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
   void dispose() {
     timer?.cancel();
     hapticTimer?.cancel();
+    sosHoldTimer?.cancel();
     super.dispose();
   }
 
+  void _startSosHold() {
+    if (widget.emergencyId != null || sosSending) return;
+    HapticFeedback.selectionClick();
+    const tickMs = 60;
+    var elapsed = 0;
+    sosHoldTimer?.cancel();
+    sosHoldTimer = Timer.periodic(const Duration(milliseconds: tickMs), (t) {
+      elapsed += tickMs;
+      final progress = (elapsed / _sosHoldDuration.inMilliseconds).clamp(0.0, 1.0);
+      if (mounted) setState(() => sosHoldProgress = progress);
+      if (progress >= 1.0) {
+        t.cancel();
+        _triggerManualSos();
+      }
+    });
+  }
+
+  void _cancelSosHold() {
+    sosHoldTimer?.cancel();
+    if (mounted) setState(() => sosHoldProgress = 0);
+  }
+
+  Future<void> _triggerManualSos() async {
+    setState(() {
+      sosSending = true;
+      sosHoldProgress = 0;
+    });
+    HapticFeedback.heavyImpact();
+    try {
+      final patientId = ref.read(sessionProvider).userId;
+      final created = await ref.read(apiClientProvider).createManualSos(patientId);
+      final emergencyId = created['id']?.toString();
+      if (mounted && emergencyId != null) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => EmergencyPage(emergencyId: emergencyId)),
+        );
+      }
+    } on ApiException catch (e) {
+      if (mounted) setState(() => message = 'SOS failed: ${e.message}');
+    } finally {
+      if (mounted) setState(() => sosSending = false);
+    }
+  }
+
   Future<void> _action(String action) async {
-    if (widget.emergencyId == null || busy) return;
+    if (widget.emergencyId == null || busy || resolved) return;
     timer?.cancel();
     hapticTimer?.cancel();
     setState(() => busy = true);
@@ -806,7 +864,15 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
         }
       }
       final response = await ref.read(apiClientProvider).emergencyAction(widget.emergencyId!, action, body);
-      if (mounted) setState(() => message = 'Emergency status: ${response['status']}');
+      // VERIFICATION is the only status the confirm/cancel buttons apply to -- once it moves on
+      // (CONFIRMED/CANCELLED/etc), stop offering actions that the backend will now correctly
+      // reject as an invalid transition.
+      if (mounted) {
+        setState(() {
+          message = 'Emergency status: ${response['status']}';
+          resolved = response['status'] != 'VERIFICATION';
+        });
+      }
     } on ApiException catch (error) {
       if (mounted) setState(() => message = error.message);
     } finally {
@@ -837,7 +903,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
                   : 'An abnormal health pattern has been detected.',
               textAlign: TextAlign.center,
             ),
-            if (widget.emergencyId != null) ...[
+            if (widget.emergencyId != null && !resolved) ...[
               const SizedBox(height: 20),
               if (loadingCountdown)
                 const CircularProgressIndicator()
@@ -853,34 +919,85 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
               const Text('seconds to respond', style: TextStyle(fontWeight: FontWeight.w700)),
             ],
             const SizedBox(height: 24),
-            PrimaryButton(
-              label: "I'm OK",
-              onPressed: widget.emergencyId == null ? () => Navigator.pop(context) : () => _action('cancel'),
-              loading: busy,
-              icon: Icons.check_circle_outline,
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              height: 54,
-              child: FilledButton.icon(
-                style: FilledButton.styleFrom(backgroundColor: MedilinkColors.red),
-                onPressed: widget.emergencyId == null ? null : () => _action('confirm'),
-                icon: const Icon(Icons.call),
-                label: const Text('I NEED HELP'),
+            if (widget.emergencyId != null && resolved) ...[
+              SectionCard(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      const Icon(Icons.check_circle, color: MedilinkColors.teal, size: 40),
+                      const SizedBox(height: 8),
+                      Text(
+                        message ?? 'Emergency confirmed. Caretakers are being contacted.',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ],
+                  ),
+                ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Text(
-                'Caretakers are called/texted from this phone\'s own SIM — keep it on and connected.',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: MedilinkColors.amber),
+              const SizedBox(height: 12),
+              OutlinedButton(
+                onPressed: () => Navigator.of(context).popUntil((r) => r.isFirst),
+                child: const Text('Back to home'),
               ),
-            ),
-            if (message != null)
-              Padding(padding: const EdgeInsets.only(top: 16), child: Text(message!)),
-            const SizedBox(height: 20),
-            const Text('PRESS AND HOLD FOR SOS', style: TextStyle(fontWeight: FontWeight.w800, color: MedilinkColors.red)),
+            ] else ...[
+              PrimaryButton(
+                label: "I'm OK",
+                onPressed: widget.emergencyId == null ? () => Navigator.pop(context) : () => _action('cancel'),
+                loading: busy,
+                icon: Icons.check_circle_outline,
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                height: 54,
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: MedilinkColors.red),
+                  onPressed: widget.emergencyId == null ? null : () => _action('confirm'),
+                  icon: const Icon(Icons.call),
+                  label: const Text('I NEED HELP'),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  'Caretakers are called/texted from this phone\'s own SIM — keep it on and connected.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(color: MedilinkColors.amber),
+                ),
+              ),
+              if (message != null)
+                Padding(padding: const EdgeInsets.only(top: 16), child: Text(message!)),
+            ],
+            if (widget.emergencyId == null) ...[
+              const SizedBox(height: 20),
+              GestureDetector(
+                onTapDown: (_) => _startSosHold(),
+                onTapUp: (_) => _cancelSosHold(),
+                onTapCancel: _cancelSosHold,
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 18),
+                  decoration: BoxDecoration(
+                    color: MedilinkColors.red.withValues(alpha: 0.08 + sosHoldProgress * 0.5),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: MedilinkColors.red, width: 2),
+                  ),
+                  child: Column(
+                    children: [
+                      if (sosSending)
+                        const CircularProgressIndicator(color: MedilinkColors.red)
+                      else
+                        const Text('PRESS AND HOLD FOR SOS', style: TextStyle(fontWeight: FontWeight.w800, color: MedilinkColors.red)),
+                      if (sosHoldProgress > 0 && !sosSending) ...[
+                        const SizedBox(height: 10),
+                        LinearProgressIndicator(value: sosHoldProgress, color: MedilinkColors.red),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),

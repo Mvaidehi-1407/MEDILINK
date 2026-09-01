@@ -29,11 +29,19 @@ class RealtimeConnection with WidgetsBindingObserver {
   Stream<Map<String, dynamic>> get events => _controller.stream;
   bool get isConnected => _connected;
 
+  // Mirrors ApiClient's compile-time default exactly -- must stay in sync so the WebSocket and
+  // REST API target the same backend. A real device needs this overridden via
+  // --dart-define=MEDILINK_API_URL=..., since 10.0.2.2 only resolves on the Android emulator.
+  static const _defaultApiBaseUrl = String.fromEnvironment(
+    'MEDILINK_API_URL',
+    defaultValue: 'http://10.0.2.2:8000/api',
+  );
+
   void _connect() {
     if (_disposed) return;
     final token = _session.accessToken;
     if (token == null) return;
-    final apiBase = _session.apiBaseUrl ?? 'http://10.0.2.2:8000/api';
+    final apiBase = _session.apiBaseUrl ?? _defaultApiBaseUrl;
     final root = apiBase
         .replaceFirst(RegExp(r'/api$'), '')
         .replaceFirst('http://', 'ws://')

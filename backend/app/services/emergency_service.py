@@ -246,6 +246,11 @@ class EmergencyService:
         updated = await self._notify_stage1_contacts(updated)
         return updated
 
+    def _next_attempt_delay(self, attempt_status: str) -> timedelta:
+        if attempt_status == "NO_DEVICE_CONNECTED":
+            return timedelta(seconds=self.settings.caretaker_reconnect_retry_seconds)
+        return timedelta(minutes=self.settings.caretaker_reping_interval_minutes)
+
     async def _ordered_caretakers(self, patient_id: str) -> list[dict]:
         contacts = await MongoRepository(self.db, "emergency_contacts").list({"patientId": patient_id}, limit=20)
         # priority 1/2/3 from signup sorts first; any older/manually-added contact (no priority
@@ -278,8 +283,8 @@ class EmergencyService:
             "contactNotifiedAt": now,
             "escalationCycle": 1,
             "escalationPriority": 1,
-            "nextEscalationAttemptAt": now + timedelta(minutes=self.settings.caretaker_reping_interval_minutes),
-            "callStatus": {"status": "RELAYED_TO_DEVICE", "callProviderMode": "native_relay", "attempts": [attempt]},
+            "nextEscalationAttemptAt": now + self._next_attempt_delay(attempt["status"]),
+            "callStatus": {"status": attempt["status"], "callProviderMode": "native_relay", "attempts": [attempt]},
         }})
         await self._log(emergency["id"], emergency["patientId"], "contactNotified", updated)
         await self._broadcast(updated)
@@ -289,7 +294,12 @@ class EmergencyService:
         """Continuous 3-caretaker priority loop (never stops just because a contact didn't
         answer): advances 1->2->3, then wraps back to 1 and increments the cycle count. Only
         called by the sweep for emergencies still CONFIRMED/CONTACT_NOTIFIED and unacknowledged --
-        stops the moment acknowledge_contact(), resolve(), or cancel() runs."""
+        stops the moment acknowledge_contact(), resolve(), or cancel() runs.
+
+        If the previous attempt never actually reached the patient's device (no WebSocket
+        connected -- e.g. the app had just been opened and was still connecting), retry the SAME
+        caretaker shortly instead of moving on: advancing priority would be treating "we never
+        actually tried" the same as "we tried and got no answer", which isn't honest."""
         from app.utils.mongo import object_id, serialize_doc
 
         contacts = await self._ordered_caretakers(emergency["patientId"])
@@ -298,10 +308,15 @@ class EmergencyService:
 
         current_priority = emergency.get("escalationPriority") or 1
         cycle = emergency.get("escalationCycle") or 1
-        next_priority = current_priority + 1
-        if next_priority > len(contacts):
-            next_priority = 1
-            cycle += 1
+        last_status = (emergency.get("callStatus") or {}).get("status")
+
+        if last_status == "NO_DEVICE_CONNECTED":
+            next_priority = current_priority
+        else:
+            next_priority = current_priority + 1
+            if next_priority > len(contacts):
+                next_priority = 1
+                cycle += 1
         contact = contacts[next_priority - 1]
 
         patient_doc = serialize_doc(await self.db.users.find_one({"_id": object_id(emergency["patientId"])})) or {}
@@ -318,8 +333,8 @@ class EmergencyService:
             "timeline": timeline, "updatedAt": now,
             "escalationCycle": cycle,
             "escalationPriority": next_priority,
-            "nextEscalationAttemptAt": now + timedelta(minutes=self.settings.caretaker_reping_interval_minutes),
-            "callStatus": {"status": "RELAYED_TO_DEVICE", "callProviderMode": "native_relay", "attempts": attempts},
+            "nextEscalationAttemptAt": now + self._next_attempt_delay(attempt["status"]),
+            "callStatus": {"status": attempt["status"], "callProviderMode": "native_relay", "attempts": attempts},
         }})
         await self._log(emergency["id"], emergency["patientId"], "contactReattempted", updated)
         await self._broadcast(updated)

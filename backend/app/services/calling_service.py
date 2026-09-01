@@ -41,9 +41,10 @@ class CallingService:
             "priority": priority,
             "timestamp": utcnow(),
         }
-        await manager.broadcast(f"patient:{patient_id}", "escalation.attempt", attempt)
+        delivered = await manager.broadcast(f"patient:{patient_id}", "escalation.attempt", attempt)
         return {
-            "provider": "NativeRelay", "channel": "relay", "status": "RELAYED_TO_DEVICE",
+            "provider": "NativeRelay", "channel": "relay",
+            "status": "RELAYED_TO_DEVICE" if delivered > 0 else "NO_DEVICE_CONNECTED",
             "recipient": contact.get("phone"), "emergencyId": emergency_id, "cycle": cycle,
             "priority": priority, "timestamp": utcnow(), "demo": False,
         }

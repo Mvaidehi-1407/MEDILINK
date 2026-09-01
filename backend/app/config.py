@@ -56,8 +56,14 @@ class Settings(BaseSettings):
     contact_ack_window_minutes: int = 5
     escalation_sweep_interval_seconds: int = 20
     # How often the 3-caretaker priority loop advances to the next contact (wrapping back to
-    # caretaker 1 and incrementing the cycle count) while an emergency stays un-acknowledged.
+    # caretaker 1 and incrementing the cycle count) while an emergency stays un-acknowledged, once
+    # the relay genuinely reached the patient's device.
     caretaker_reping_interval_minutes: int = 3
+    # Much shorter retry when the *reason* to move on was that nobody was connected yet (a
+    # just-opened app's WebSocket still finishing its handshake) rather than a real unanswered
+    # alert -- so a brief connectivity race doesn't cost the full re-ping interval before the
+    # same caretaker gets a genuine attempt.
+    caretaker_reconnect_retry_seconds: int = 15
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

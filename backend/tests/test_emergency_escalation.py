@@ -13,6 +13,16 @@ from app.schemas.health import HealthReadingCreate, MotionReading
 from app.services.emergency_service import EmergencyService
 from app.services.health_service import HealthService
 from app.utils.time import utcnow
+from app.websocket.manager import manager
+
+
+class _FakeDeviceSocket:
+    """Stands in for a patient's real WebSocket connection so relay_to_patient_device() honestly
+    reports RELAYED_TO_DEVICE instead of NO_DEVICE_CONNECTED in tests that need to simulate the
+    device actually being online."""
+
+    async def send_json(self, message):
+        pass
 
 
 def _settings(**overrides) -> Settings:
@@ -161,7 +171,9 @@ async def test_need_help_with_contact_notifies_stage1_then_acknowledge_stops_esc
     created = await emergency.route_reading(reading, risk, panic)
     confirmed = await emergency.confirm(created["id"], EmergencyConfirmRequest(patientResponse="NEED_HELP"))
     assert confirmed["escalationStage"] == "CONTACT_NOTIFIED"
-    assert confirmed["callStatus"]["status"] == "RELAYED_TO_DEVICE"
+    # No real WebSocket connection in this test -> honestly reports nobody was there to relay to,
+    # never a fabricated "RELAYED_TO_DEVICE" (see app.websocket.manager.ConnectionManager.broadcast).
+    assert confirmed["callStatus"]["status"] == "NO_DEVICE_CONNECTED"
 
     acked = await emergency.acknowledge_contact(confirmed["id"], acknowledger_id=str(ObjectId()))
     assert acked["escalationStage"] == "CONTACT_NOTIFIED"
@@ -189,11 +201,16 @@ async def test_continuous_caretaker_loop_cycles_through_all_three_and_wraps(mock
         {"patientId": pid, "name": "Care Three", "phone": "+919999900003", "isPrimary": False, "priority": 3},
     ])
 
+    # Simulate the patient's device being genuinely connected for this whole test, so the loop
+    # advances on real (not just timed-out) attempts.
+    manager.register(f"patient:{pid}", _FakeDeviceSocket())
+
     reading, risk, panic = await health.record_reading(_reading(pid, motion=MotionReading(state="STATIONARY"), **HIGH_RISK))
     created = await emergency.route_reading(reading, risk, panic)
     confirmed = await emergency.confirm(created["id"], EmergencyConfirmRequest(patientResponse="NEED_HELP"))
     assert confirmed["escalationPriority"] == 1
     assert confirmed["escalationCycle"] == 1
+    assert confirmed["callStatus"]["status"] == "RELAYED_TO_DEVICE"
 
     async def _advance():
         past = utcnow() - datetime.timedelta(minutes=10)
@@ -221,6 +238,57 @@ async def test_continuous_caretaker_loop_cycles_through_all_three_and_wraps(mock
     still = await _advance()
     assert still["escalationPriority"] == 1
     assert still["escalationCycle"] == 2
+
+    manager.active[f"patient:{pid}"].clear()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_race_retries_same_caretaker_instead_of_skipping(mock_db):
+    """A just-opened app's WebSocket may still be connecting when Stage 1 fires -- the loop must
+    retry the SAME caretaker shortly after, not treat 'nobody was listening yet' the same as 'we
+    tried and got no answer' by moving on to caretaker 2."""
+    from app.schemas.emergency import EmergencyConfirmRequest
+
+    health, emergency = await _make_service(mock_db, caretaker_reconnect_retry_seconds=15)
+    pid = _new_patient_id()
+    await _register_patient(mock_db, pid)
+    await mock_db.emergency_contacts.insert_many([
+        {"patientId": pid, "name": "Care One", "phone": "+919999900001", "isPrimary": True, "priority": 1},
+        {"patientId": pid, "name": "Care Two", "phone": "+919999900002", "isPrimary": False, "priority": 2},
+    ])
+
+    reading, risk, panic = await health.record_reading(_reading(pid, motion=MotionReading(state="STATIONARY"), **HIGH_RISK))
+    created = await emergency.route_reading(reading, risk, panic)
+    confirmed = await emergency.confirm(created["id"], EmergencyConfirmRequest(patientResponse="NEED_HELP"))
+    assert confirmed["callStatus"]["status"] == "NO_DEVICE_CONNECTED"
+    assert confirmed["escalationPriority"] == 1
+
+    # Device still not connected on the next sweep -- must retry caretaker 1 again, not skip to 2.
+    past = utcnow() - datetime.timedelta(minutes=1)
+    await mock_db.emergencies.update_one({"patientId": pid}, {"$set": {"nextEscalationAttemptAt": past}})
+    await emergency.sweep_time_based_transitions()
+    still_priority_1 = await emergency.get(confirmed["id"])
+    assert still_priority_1["escalationPriority"] == 1
+    assert still_priority_1["escalationCycle"] == 1
+
+    # Device connects for real -- the next attempt for the SAME caretaker (still priority 1)
+    # finally succeeds.
+    manager.register(f"patient:{pid}", _FakeDeviceSocket())
+    await mock_db.emergencies.update_one({"patientId": pid}, {"$set": {"nextEscalationAttemptAt": past}})
+    await emergency.sweep_time_based_transitions()
+    delivered = await emergency.get(confirmed["id"])
+    assert delivered["escalationPriority"] == 1
+    assert delivered["callStatus"]["status"] == "RELAYED_TO_DEVICE"
+
+    # Only now, with a genuine delivered attempt behind it, does the next sweep move on to
+    # caretaker 2.
+    await mock_db.emergencies.update_one({"patientId": pid}, {"$set": {"nextEscalationAttemptAt": past}})
+    await emergency.sweep_time_based_transitions()
+    advanced = await emergency.get(confirmed["id"])
+    assert advanced["escalationPriority"] == 2
+    assert advanced["callStatus"]["status"] == "RELAYED_TO_DEVICE"
+
+    manager.active[f"patient:{pid}"].clear()
 
 
 @pytest.mark.asyncio
