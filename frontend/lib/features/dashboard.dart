@@ -66,7 +66,7 @@ class _RoleShellState extends ConsumerState<RoleShell> {
           ]
         : role == 'DOCTOR'
         ? [
-            const RoleOverview('Doctor dashboard'),
+            RoleOverview('Doctor dashboard', role: role),
             const PatientConnections(),
             const EmergencyList(),
             const ChatPage(),
@@ -74,15 +74,17 @@ class _RoleShellState extends ConsumerState<RoleShell> {
           ]
         : role == 'HOSPITAL'
         ? [
-            const RoleOverview('Hospital command center'),
+            RoleOverview('Hospital command center', role: role),
             const EmergencyList(),
             const PatientConnections(),
+            const ChatPage(),
             const ProfilePage(),
           ]
         : [
-            const RoleOverview('Caregiver home'),
+            RoleOverview('Caregiver home', role: role),
             const PatientConnections(),
             const EmergencyList(),
+            const ChatPage(),
             const ProfilePage(),
           ];
     final labels = role == 'PATIENT'
@@ -90,8 +92,8 @@ class _RoleShellState extends ConsumerState<RoleShell> {
         : role == 'DOCTOR'
         ? ['Home', 'Patients', 'Alerts', 'Messages', 'Profile']
         : role == 'HOSPITAL'
-        ? ['Command', 'Emergencies', 'Patients', 'Profile']
-        : ['Home', 'Patients', 'Alerts', 'Profile'];
+        ? ['Command', 'Emergencies', 'Patients', 'Messages', 'Profile']
+        : ['Home', 'Patients', 'Alerts', 'Messages', 'Profile'];
     if (index >= views.length) index = 0;
     return Scaffold(
       body: SafeArea(
@@ -128,33 +130,37 @@ class _RoleShellState extends ConsumerState<RoleShell> {
 }
 
 class RoleOverview extends StatelessWidget {
-  const RoleOverview(this.title, {super.key});
+  const RoleOverview(this.title, {super.key, required this.role});
   final String title;
+  final String role;
+
+  String get _blurb => switch (role) {
+    'DOCTOR' => 'Your connected patients, alerts, and AI-assisted clinical summaries.',
+    'HOSPITAL' => 'Incoming emergencies and the patients/doctors your facility is connected with.',
+    _ => 'Your assigned patients and the emergency alerts that need your acknowledgement.',
+  };
+
   @override
   Widget build(BuildContext context) => PageFrame(
     title: title,
     child: ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const SectionCard(
-          child: Text(
-            'Connected MEDILINK workspace. Statuses are shown only after the backend confirms them.',
-          ),
-        ),
+        SectionCard(child: Text(_blurb)),
         const SizedBox(height: 16),
         Wrap(
           spacing: 10,
           runSpacing: 10,
           children: [
             ActionTile(
-              'Patients',
-              Icons.groups_outlined,
-              () => _open(context, const PatientConnections()),
+              role == 'HOSPITAL' ? 'Emergencies' : 'Patients',
+              role == 'HOSPITAL' ? Icons.emergency_outlined : Icons.groups_outlined,
+              () => _open(context, role == 'HOSPITAL' ? const EmergencyList() : const PatientConnections()),
             ),
             ActionTile(
-              'Alerts',
-              Icons.emergency_outlined,
-              () => _open(context, const EmergencyList()),
+              role == 'HOSPITAL' ? 'Patients' : 'Alerts',
+              role == 'HOSPITAL' ? Icons.groups_outlined : Icons.emergency_outlined,
+              () => _open(context, role == 'HOSPITAL' ? const PatientConnections() : const EmergencyList()),
             ),
             ActionTile(
               'Messages',
@@ -307,6 +313,11 @@ class _PatientHomeState extends ConsumerState<PatientHome> {
                 'QR',
                 Icons.qr_code_2_outlined,
                 () => _open(context, const QrPage()),
+              ),
+              ActionTile(
+                'Messages',
+                Icons.chat_bubble_outline,
+                () => _open(context, const ChatPage()),
               ),
             ],
           ),
@@ -1256,6 +1267,15 @@ class ConnectionsPage extends StatelessWidget {
             onTap: () => _open(context, const ContactsPage()),
           ),
         ),
+        const SizedBox(height: 12),
+        SectionCard(
+          child: ListTile(
+            leading: const Icon(Icons.chat_bubble_outline),
+            title: const Text('Messages'),
+            subtitle: const Text('Chat with your connected doctors and caregivers'),
+            onTap: () => _open(context, const ChatPage()),
+          ),
+        ),
       ],
     ),
   );
@@ -1372,6 +1392,11 @@ class _QrPageState extends ConsumerState<QrPage> {
                 onPressed: _create,
                 child: const Text('Create profile QR'),
               ),
+              if (_createError != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(_createError!, style: const TextStyle(color: MedilinkColors.red)),
+                ),
               const SizedBox(height: 12),
               OutlinedButton.icon(
                 onPressed: () => Navigator.of(context).push(
@@ -1386,11 +1411,17 @@ class _QrPageState extends ConsumerState<QrPage> {
       ),
     ),
   );
+  String? _createError;
   Future<void> _create() async {
-    final r = await ref
-        .read(apiClientProvider)
-        .post('/qr', body: {'purpose': 'PROFILE', 'expiresInMinutes': 15});
-    if (mounted) setState(() => token = (r as Map)['token']?.toString());
+    setState(() => _createError = null);
+    try {
+      final r = await ref
+          .read(apiClientProvider)
+          .post('/qr', body: {'purpose': 'PROFILE', 'expiresInMinutes': 15});
+      if (mounted) setState(() => token = (r as Map)['token']?.toString());
+    } catch (e) {
+      if (mounted) setState(() => _createError = 'Could not create a QR code. Check your connection and try again.');
+    }
   }
 }
 
@@ -1411,10 +1442,19 @@ class _QrScanPageState extends ConsumerState<QrScanPage> {
     if (raw == null) return;
     setState(() => _handled = true);
     try {
-      final result = await ref.read(apiClientProvider).get('/qr/$raw') as Map;
+      final result = await ref.read(apiClientProvider).get('/qr/$raw');
+      if (result is! Map) throw const FormatException('Unexpected response');
       setState(() => _info = Map<String, dynamic>.from(result));
     } on ApiException catch (e) {
-      setState(() => _error = e.message);
+      setState(() {
+        _error = e.message;
+        _handled = false;
+      });
+    } catch (_) {
+      setState(() {
+        _error = 'Could not read that QR code. Try scanning again.';
+        _handled = false;
+      });
     }
   }
 
@@ -1443,6 +1483,7 @@ class _PatientInfoResult extends StatelessWidget {
   Widget build(BuildContext context) {
     final patient = info['patient'] as Map?;
     final contacts = (info['emergencyContacts'] as List?) ?? [];
+    final documents = (info['documentSummaries'] as List?) ?? [];
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -1469,6 +1510,43 @@ class _PatientInfoResult extends StatelessWidget {
                   subtitle: Text(c['phone']?.toString() ?? ''),
                 ),
               )),
+        const SizedBox(height: 16),
+        Text('Document summaries', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800)),
+        const SizedBox(height: 8),
+        if (documents.isEmpty)
+          const Text('No AI-summarized documents on file.')
+        else
+          ...documents.map((d) {
+            final summary = d['summary'] as Map?;
+            final observations = (summary?['keyObservations'] as List?) ?? [];
+            final explanation = summary?['simplifiedExplanation']?.toString() ?? '';
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: SectionCard(
+                child: Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(d['filename']?.toString() ?? 'Document', style: const TextStyle(fontWeight: FontWeight.w700)),
+                      if (observations.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Text(observations.join('\n')),
+                      ],
+                      if (explanation.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Text(explanation, style: const TextStyle(fontStyle: FontStyle.italic)),
+                      ],
+                      if (summary?['disclaimer'] != null) ...[
+                        const SizedBox(height: 6),
+                        Text(summary!['disclaimer'].toString(), style: const TextStyle(color: Colors.blueGrey, fontSize: 11)),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }),
       ],
     );
   }

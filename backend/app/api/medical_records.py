@@ -39,7 +39,9 @@ async def upload_record(
 
     bucket = AsyncIOMotorGridFSBucket(database)
     gridfs_id = await bucket.upload_from_stream(file.filename or "medical-record", data, metadata={"patientId": patientId, "ownerId": user["id"], "contentType": file.content_type})
-    summary_result = await ReportSummaryService().summarize(file.filename or "medical-record", file.content_type or "application/octet-stream", data.decode("utf-8", errors="ignore") if file.content_type == "text/plain" else None)
+    summary_service = ReportSummaryService()
+    raw_text = summary_service.extract_text(file.content_type or "", data)
+    summary_result = await summary_service.summarize(file.filename or "medical-record", file.content_type or "application/octet-stream", raw_text)
     return await MongoRepository(database, "medical_records").insert({
         "patientId": patientId,
         "ownerId": user["id"],

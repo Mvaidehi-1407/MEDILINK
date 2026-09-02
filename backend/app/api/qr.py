@@ -54,5 +54,20 @@ async def validate_qr(token: str, _: dict = Depends(get_current_user), database:
         result["emergencyContacts"] = [
             {"name": c.get("name"), "phone": c.get("phone")} for c in contacts
         ]
+        # Most recent AI-summarized vault documents -- exactly what a first responder or
+        # clinician scanning this QR needs to see fast, never the raw file (that still requires
+        # the normal consent-gated /medical-records download).
+        records = await MongoRepository(database, "medical_records").list(
+            {"patientId": patient_id, "summaryStatus": "AVAILABLE"}, limit=5, sort=[("createdAt", -1)],
+        )
+        result["documentSummaries"] = [
+            {
+                "filename": r.get("filename"),
+                "category": r.get("category"),
+                "createdAt": r.get("createdAt"),
+                "summary": r.get("summary"),
+            }
+            for r in records
+        ]
     return result
 

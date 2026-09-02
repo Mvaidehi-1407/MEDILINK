@@ -92,11 +92,30 @@ class _MedicalVaultPageState extends ConsumerState<MedicalVaultPage> {
                     const Divider(height: 24),
                     const Text('AI summary', style: TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 6),
-                    Text((record['summary']['keyObservations'] as List?)?.join('\n') ?? ''),
-                    const SizedBox(height: 6),
+                    if ((record['summary']['keyObservations'] as List?)?.isNotEmpty ?? false) ...[
+                      const Text('Key observations', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
+                      Text((record['summary']['keyObservations'] as List).join('\n')),
+                      const SizedBox(height: 8),
+                    ],
+                    if ((record['summary']['simplifiedExplanation']?.toString() ?? '').isNotEmpty) ...[
+                      const Text('In plain terms', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
+                      Text(record['summary']['simplifiedExplanation'].toString()),
+                      const SizedBox(height: 8),
+                    ],
+                    if ((record['summary']['importantTerms'] as List?)?.isNotEmpty ?? false) ...[
+                      const Text('Terms explained', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
+                      Text((record['summary']['importantTerms'] as List).join(', ')),
+                      const SizedBox(height: 8),
+                    ],
                     Text(
                       record['summary']['disclaimer']?.toString() ?? '',
                       style: const TextStyle(color: Colors.blueGrey, fontSize: 12),
+                    ),
+                  ] else if (record['summaryStatus'] == 'UNAVAILABLE') ...[
+                    const Divider(height: 24),
+                    const Text(
+                      'No AI summary available for this file type (images aren\'t text-extracted). PDF and text files get a real summary.',
+                      style: TextStyle(color: Colors.blueGrey, fontSize: 12),
                     ),
                   ],
                 ],

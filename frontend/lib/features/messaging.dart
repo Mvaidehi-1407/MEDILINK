@@ -82,18 +82,23 @@ class _ConversationPageState extends ConsumerState<ConversationPage> {
     if (text.isEmpty || _sending) return;
     setState(() => _sending = true);
     try {
-      final message = await ref.read(apiClientProvider).post('/messages', body: {
+      final response = await ref.read(apiClientProvider).post('/messages', body: {
         'conversationId': widget.conversationId,
         'receiverId': widget.otherPartyId,
         'message': text,
-      }) as Map;
-      setState(() {
-        _messages = [..._messages, Map<String, dynamic>.from(message)];
-        _controller.clear();
       });
-      _scrollToBottom();
+      if (response is! Map) throw const FormatException('Unexpected response');
+      if (mounted) {
+        setState(() {
+          _messages = [..._messages, Map<String, dynamic>.from(response)];
+          _controller.clear();
+        });
+        _scrollToBottom();
+      }
     } on ApiException catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Could not send message. Try again.')));
     } finally {
       if (mounted) setState(() => _sending = false);
     }
