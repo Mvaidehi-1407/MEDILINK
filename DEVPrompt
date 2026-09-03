@@ -1,0 +1,140 @@
+# MEDILINK — Fully Automated Demo Mode (Build Prompt)
+
+## Context for Claude Code
+
+MEDILINK is a Flutter emergency healthcare app (SIH prototype). It already has:
+
+- `VitalsProvider`, `EmergencyProvider` (with a `DETECTED → RESOLVED/CANCELLED` state machine and a countdown-based SOS flow)
+- `VitalsService`, `EmergencyService`, `LocationService`
+- An existing SOS flow: on abnormal vitals detection, a 10-second countdown screen appears; if the user does not respond (or confirms help is needed), the app calls the caretaker, sends an SMS with live location + vitals snapshot, and advances the emergency state machine. "I'm OK" cancels the countdown and returns to monitoring.
+- **An existing Developer Mode area.** Do not create a new toggle or a new debug settings screen — inspect the existing developer mode first and add this feature inside it.
+
+**Problem:** No physical BLE wearable exists to test this end-to-end. Manually tapping the SOS button proves the call/SMS/location pipeline, but not the actual decision logic that decides whether — and which kind of — alert should fire.
+
+**Goal:** Build a fully automated Demo Mode inside Developer Mode that runs on its own — no manual trigger buttons, no manual button presses. A timer periodically feeds synthetic vitals into the existing pipeline, and the full detection → countdown → escalation flow (including real calls and real SMS) runs exactly as it would in production. No ML model, no unsupervised anomaly detection — just deterministic, engineered rules driving an automatic cycle.
+
+---
+
+## First step — inspect before building
+
+Before writing any code: locate the existing Developer Mode screen/widget and understand how it's toggled and rendered.
+
+---
+
+## Core concept
+
+Demo Mode lives inside the **existing Developer Mode area** — no new toggle screen, no manual trigger panel. When enabled, it is fully automatic from that point on: a timer selects readings and pushes them into `VitalsProvider`, exactly as the real BLE stream would. Nothing downstream (vitals ring, dashboard, `EmergencyProvider`, alert screens) should behave any differently than it would with real data — Demo Mode only changes the *source* of the reading, never how it's processed.
+
+There is no manual button panel. Demo Mode is a single automated mode.
+
+---
+
+## Automated Demo Mode — how it runs
+
+A single toggle within Developer Mode, off by default and requiring explicit confirmation to enable (e.g. a confirm dialog: *"Demo Mode will run automatically and may place real calls and send real SMS when it triggers an emergency. Continue?"*).
+
+When enabled:
+
+- A timer (configurable interval, e.g. every 20–40s) selects a normal reading and pushes it into `VitalsProvider`, keeping the dashboard/ring updating continuously.
+- Separately, an abnormal reading is injected roughly **every 1–2 minutes** (randomized within that window so it's not predictable to the second), picked from the abnormal scenarios in the dataset (resting emergency, exercise-context spike, or ambiguous/override).
+- Normal readings simply update the dashboard/ring, no alert.
+- Abnormal readings run through the **real, unmodified** escalation path — actual phone call, actual SMS, actual location — not a simulated/blocked trigger. This is the point: prove the full pipeline fires for real without a human in the loop.
+- **Hard cooldown is mandatory.** Once an emergency has been triggered and is unresolved (or was just resolved), Demo Mode must not fire another abnormal reading until a configurable cooldown period has passed (e.g. 2 minutes), even if the abnormal-injection timer would otherwise select one. This prevents repeated real calls/SMS from firing back-to-back.
+- While an alert is active (countdown running or unresolved), Demo Mode pauses its own scheduling entirely — it does not queue or stack triggers.
+- The "DEMO MODE ACTIVE" banner must be visible anywhere simulated data is driving the UI (dashboard, vitals ring, alert screens) — non-negotiable, so simulated data is never mistakable for real monitoring.
+- Turning Demo Mode off mid-countdown cancels any active timer/alert cleanly — no orphaned state.
+
+---
+
+## Synthetic dataset
+
+A fixed set of readings covering:
+
+1. **Normal** — vitals within healthy range, resting. No alert.
+2. **Sudden abnormal (resting)** — a genuine emergency signature: vitals spike/drop sharply with `motionContext: resting`. Triggers the *existing*, unmodified SOS countdown flow (10s, call/SMS/location on timeout or confirm, cancel on "I'm OK").
+3. **Sudden abnormal (exercise context)** — vitals spike consistent with exertion (elevated HR, `motionContext: running`). Triggers a **new, distinct Health Check flow** (see below), not SOS.
+4. **Ambiguous/Override** — an extreme reading tagged with exercise context, but severe enough to bypass the exercise exemption and escalate straight to SOS regardless of motion tag.
+
+Keep these as fixed, documented constants (e.g. in `demo_readings.dart`), not procedurally generated, so behavior is predictable and debuggable even though the *timing* of selection is automatic.
+
+---
+
+## Two-tier alert logic
+
+**Tier 1 — Sudden abnormal, resting → existing SOS flow (unchanged)**
+- Fires the current `EmergencyProvider` `DETECTED` state exactly as manual SOS does today.
+- 10-second countdown screen.
+- "I'm OK" → cancel, return to monitoring.
+- No response / confirms help needed → escalate: call caretaker, send SMS with location + vitals snapshot, advance the state machine as it already does.
+- **The SMS must include the existing generic emergency message plus the actual abnormal vitals values that triggered the alert** (e.g. heart rate, SpO2, blood pressure — whichever reading caused the escalation). Keep the generic wording as-is and append the specific vitals data to it, rather than replacing one with the other.
+
+**Tier 2 — Sudden abnormal, exercise context → new Health Check flow**
+- New screen/modal, visually distinct from the SOS countdown screen (different color/icon language — never confusable with a real emergency alert).
+- 60-second countdown.
+- Two explicit options: "I'm OK" and "I need help."
+- "I'm OK" before timeout → dismiss, return to monitoring, no call/SMS.
+- "I need help" or timeout → escalate through the **same** call/SMS/location pipeline used by Tier 1 (same generic message + vitals values format). Do not duplicate that logic — call the shared escalation method.
+
+**Override rule (the one real piece of decision logic)**
+Implement this as an actual, testable function:
+
+```
+if spo2 < 85 OR heart_rate > 180:
+    force_escalation_path = SOS   # ignore motionContext entirely
+```
+
+Document this threshold clearly in code comments. This is the only branching logic in the module; everything else is direct routing by scenario.
+
+---
+
+## State machine note
+
+Don't fork `EmergencyEvent`'s state machine. Add a lightweight distinction — an `EmergencyTrigger` enum (`suddenAbnormal` / `exerciseAbnormal`) or an `isExerciseContext` flag on the `DETECTED` state — so both tiers resolve through the same `DETECTED → RESOLVED/CANCELLED` machine, just with different countdown durations and different first-screen UI.
+
+---
+
+## New/modified components
+
+- `demo_readings.dart` — the fixed synthetic readings (constants, not manual-trigger buttons)
+- `DemoModeEngine` — timer-driven service that selects readings, applies the cooldown, and pushes into `VitalsProvider`
+- `HealthCheckScreen` — new screen for the Tier 2 60-second flow, visually distinct from `EmergencyCountdownScreen`
+- `EmergencyProvider` — extend (not replace) to accept a trigger type/context flag and route to the correct first screen with the correct countdown duration
+- A persistent **"DEMO MODE ACTIVE"** banner/badge shown anywhere simulated data is driving the UI
+
+---
+
+## Edge cases to handle explicitly
+
+- Demo Mode toggled off mid-countdown → cancel any active countdown/alert/timer cleanly, no orphaned state.
+- App backgrounded during a Tier 2 Health Check countdown → resume-on-reopen logic (reuse the existing pattern from the main emergency countdown).
+- Demo Mode's own timer must never fire a second abnormal reading while one is already active/pending or within cooldown — no stacked or queued alerts.
+
+---
+
+## Acceptance criteria
+
+- No manual trigger buttons exist anywhere — Demo Mode is single-toggle, fully automatic once enabled.
+- Each auto-selected reading pushes through the exact same path `VitalsProvider` would use for real data — no special-cased UI logic downstream.
+- Normal readings → dashboard/ring update only, no alert.
+- Sudden abnormal (resting) → existing SOS flow, unmodified.
+- Sudden abnormal (exercise) → new Health Check screen, 60s countdown, two explicit options.
+- Ambiguous/Override reading → escalates straight to SOS despite exercise tag; override function is unit-testable in isolation.
+- Timeout or "I need help" on Health Check escalates through the same call/SMS/location code path as Tier 1 — verify no duplicated escalation logic.
+- The escalation SMS (both tiers) contains the existing generic message plus the specific vitals values that triggered the alert.
+- "I'm OK" on either flow cleanly returns to monitoring with no residual alert state.
+- Demo Mode requires explicit confirmation before it can be enabled.
+- Cooldown reliably prevents a second real call/SMS from firing while one emergency is unresolved or was just resolved within the cooldown window.
+- Demo Mode pauses scheduling entirely while an alert is active — never queues or stacks triggers.
+- Demo Mode banner is visible any time simulated data is active.
+- No orphaned timers/state when Demo Mode is toggled off or the app is backgrounded mid-alert.
+
+---
+
+## Explicitly out of scope for this build
+
+- No ML/anomaly-detection backend (no Isolation Forest, no FastAPI `ai_module`).
+- No manual trigger buttons or manual demo panel of any kind.
+- No BLE, wearable, or accelerometer cross-checking.
+- No third "recovering" tier.
+
+Stop after fully automated Demo Mode (with cooldown) is working and tested.
