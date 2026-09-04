@@ -110,17 +110,22 @@ class ReportGenerationService:
         }
 
     async def _generate_and_store(self, context: dict, report_type: str, patient_id: str, generated_by: str, emergency_id: str | None = None) -> dict:
+        """Coordinates report generation via LLM (Gemini) with automatic deterministic template fallback."""
+        # 1. Attempt LLM generation
         report_text, generator, model_version = await self._try_llm(context)
+        
+        # 2. Fallback to programmatic markdown template if LLM is unconfigured/fails/times out
         if report_text is None:
             report_text = self._template_fallback(context)
             generator = "TEMPLATE_FALLBACK"
             model_version = None
 
+        # 3. Persist generated clinical report into MongoDB 'reports' collection
         doc = {
             "patientId": patient_id,
             "reportType": report_type,
             "reportText": report_text,
-            "reportGenerator": generator,
+            "reportGenerator": generator, # "LLM" or "TEMPLATE_FALLBACK"
             "llmModelVersion": model_version,
             "timestamp": utcnow(),
             "generatedBy": generated_by,
@@ -129,17 +134,19 @@ class ReportGenerationService:
         return await self.reports.insert(doc)
 
     async def _try_llm(self, context: dict) -> tuple[str | None, str | None, str | None]:
+        """Calls Google GenAI Gemini API with clinical prompting and strict latency timeouts."""
         if not self.settings.llm_api_key:
             logger.info("LLM_API_KEY not configured; using template fallback.")
             return None, None, None
         try:
+            # Initialize async Gemini Client
             client = genai.Client(api_key=self.settings.llm_api_key)
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=self.settings.llm_model,
                     contents=f"{SYSTEM_PROMPT}\n\nPatient data (JSON):\n{context}",
                 ),
-                timeout=self.settings.llm_timeout_seconds,
+                timeout=self.settings.llm_timeout_seconds, # Timeout guard prevents blocking
             )
             text = (response.text or "").strip()
             if not text:
@@ -148,6 +155,7 @@ class ReportGenerationService:
         except (asyncio.TimeoutError, Exception):
             logger.warning("LLM report generation failed or timed out; using template fallback.", exc_info=True)
             return None, None, None
+
 
     @staticmethod
     def _template_fallback(context: dict) -> str:

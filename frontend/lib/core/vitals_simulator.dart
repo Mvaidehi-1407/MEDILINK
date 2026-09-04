@@ -1,9 +1,12 @@
 import 'dart:math';
 
-/// Generates plausible vitals with natural, mean-reverting variation and occasional
-/// threshold-breaching spikes -- not flat presets and not pure random noise. Used only by the
-/// Dev Mode simulator; every reading it produces still flows through the real `/api/health`
-/// pipeline so the backend (not this generator) is the source of truth for risk classification.
+/// Generates biologically plausible vitals using a mean-reverting random walk
+/// (Ornstein-Uhlenbeck stochastic process) with stochastic emergency spike regimes.
+///
+/// DESIGN PURPOSE:
+/// Enables end-to-end testing of live graph UI, ML risk classification, and emergency triggers
+/// without requiring an active Bluetooth physical medical pulse oximeter.
+
 class SimulatedVitals {
   const SimulatedVitals({
     required this.heartRate,
@@ -18,13 +21,14 @@ class SimulatedVitals {
   final int systolicBP;
   final int diastolicBP;
   final double temperature;
-  final String regime; // NORMAL | WARNING_SPIKE | HIGH_RISK_SPIKE, for on-screen context only
+  final String regime; // NORMAL | WARNING_SPIKE | HIGH_RISK_SPIKE
 }
 
 class VitalsSimulatorEngine {
   VitalsSimulatorEngine({Random? random}) : _random = random ?? Random();
   final Random _random;
 
+  // Baseline internal state
   double _hr = 72;
   double _spo2 = 97.5;
   double _systolic = 118;
@@ -34,6 +38,10 @@ class VitalsSimulatorEngine {
   int _spikeTicksRemaining = 0;
   String _spikeRegime = 'NORMAL';
 
+  /// Mean-Reverting Random Walk (Discrete Ornstein-Uhlenbeck process):
+  /// Formula: next = current + drift_factor * (baseline - current) + gaussian_noise
+  /// - drift_factor (0.25): Pulls the reading back toward physiological homeostasis.
+  /// - noise: Adds natural heartbeat-to-heartbeat biometric variance.
   double _walk(double current, double baseline, double noise, double min, double max) {
     final reverted = current + (baseline - current) * 0.25;
     final next = reverted + (_random.nextDouble() * 2 - 1) * noise;
@@ -42,7 +50,10 @@ class VitalsSimulatorEngine {
 
   SimulatedVitals next() {
     if (_spikeTicksRemaining <= 0) {
-      // 6% chance of a warning-level excursion, 2% chance of a high-risk one, each tick.
+      // Stochastic Regime Transition:
+      // - 2% chance: Sudden HIGH_RISK spike (tachycardia + desaturation)
+      // - 6% chance: Moderate WARNING spike (exertion / mild fever)
+      // - 92% chance: Stable resting equilibrium
       final roll = _random.nextDouble();
       if (roll < 0.02) {
         _spikeRegime = 'HIGH_RISK_SPIKE';
@@ -58,6 +69,7 @@ class VitalsSimulatorEngine {
     double hrBaseline = 72, spo2Baseline = 97.5, sysBaseline = 118, diaBaseline = 78, tempBaseline = 36.8;
     if (_spikeRegime == 'WARNING_SPIKE') {
       hrBaseline = 118;
+
       spo2Baseline = 93;
       sysBaseline = 148;
       diaBaseline = 92;

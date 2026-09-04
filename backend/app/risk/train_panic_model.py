@@ -48,6 +48,27 @@ def _vitals(n: int, means: list[float], stds: list[float]) -> np.ndarray:
 
 
 def build_dataset(n_total: int = 12000) -> tuple[np.ndarray, np.ndarray]:
+    """Constructs a 9-dimensional multi-modal dataset for panic pattern classification:
+    
+    FEATURE MATRIX (9 columns):
+    1. Heart Rate (bpm)
+    2. SpO2 Oxygen Saturation (%)
+    3. Systolic Blood Pressure (mmHg)
+    4. Diastolic Blood Pressure (mmHg)
+    5. Body Temperature (Celsius)
+    6. Motion Active (0 = Stationary, 1 = Active/Moving)
+    7. Is Nighttime (0 = Day 6am-10pm, 1 = Night 10pm-6am)
+    8. Has Trigger (0 = None, 1 = Stressor/Phobia Reported)
+    9. Prior Episode Count (0, 1, 2, 3+)
+    
+    LABEL ASSIGNMENT RULES (6 Categories):
+    - NONE_DETECTED: Vitals within normal physiological baselines.
+    - EXPECTED_SITUATIONAL: Abnormal vitals + patient reported an explicit emotional/environmental trigger.
+    - NOCTURNAL: Abnormal vitals occurring during sleep hours (10 PM to 6 AM).
+    - RECURRENT: Abnormal vitals in a patient with history of >=2 past panic incidents.
+    - LIMITED_SYMPTOM: Subthreshold or milder elevation in heart rate/blood pressure.
+    - UNEXPECTED_SPONTANEOUS: Sudden severe tachycardia without trigger or sleep context.
+    """
     n_normal = int(n_total * 0.45)
     n_abnormal = n_total - n_normal
 
@@ -75,13 +96,15 @@ def build_dataset(n_total: int = 12000) -> tuple[np.ndarray, np.ndarray]:
         elif prior_episodes[i] >= 2:
             labels[i] = "RECURRENT"
         else:
-            # Borderline vs. clear-cut severity split by how far systolic/HR sit above baseline.
+            # Borderline vs. clear-cut severity split based on distance from baseline
             severity = (vitals[i, 0] - 116) / 40 + (vitals[i, 2] - 116) / 60
             labels[i] = "LIMITED_SYMPTOM" if severity < 0.9 else "UNEXPECTED_SPONTANEOUS"
 
+    # Assemble 9-column feature matrix
     x = np.column_stack([vitals, motion_active, is_nighttime, has_trigger, prior_episodes])
     y = np.array([LABELS.index(label) for label in labels])
 
+    # Inject 3% stochastic label noise to simulate clinical diagnostic uncertainty
     noise_idx = RNG.choice(len(y), size=int(len(y) * 0.03), replace=False)
     for i in noise_idx:
         y[i] = RNG.integers(0, len(LABELS))
@@ -91,17 +114,22 @@ def build_dataset(n_total: int = 12000) -> tuple[np.ndarray, np.ndarray]:
 
 
 def main() -> None:
+    # 1. Build synthetic multi-modal dataset
     x, y = build_dataset()
+    # 2. Stratified 80/20 train/test split
     x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=7, stratify=y)
 
+    # 3. Train Gradient Boosting Classifier (80 estimators, max depth 4)
     model = GradientBoostingClassifier(n_estimators=80, max_depth=4, learning_rate=0.1, random_state=7)
     model.fit(x_train, y_train)
 
+    # 4. Evaluate performance on unseen holdout test set
     preds = model.predict(x_test)
     accuracy = accuracy_score(y_test, preds)
     report = classification_report(y_test, preds, target_names=LABELS, zero_division=0)
     print(f"Holdout accuracy: {accuracy:.4f}")
     print(report)
+
 
     version = f"panic-gbc-v2.0-{datetime.date.today().isoformat()}"
     MODEL_DIR.mkdir(parents=True, exist_ok=True)

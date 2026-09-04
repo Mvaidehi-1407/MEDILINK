@@ -4,22 +4,36 @@ import numpy as np
 
 from app.schemas.health import HealthReadingCreate
 
+# Standard feature order expected by the trained scikit-learn GradientBoostingClassifier
 FEATURE_ORDER = ["heartRate", "spo2", "systolicBP", "diastolicBP", "temperature"]
 
-# Plausible physiological bounds. Anything outside these (or missing/non-finite) is a data
-# quality problem, not something the ML model was trained to reason about -- route straight
-# to the rule-based fallback rather than forcing a prediction on garbage input.
+# Plausible Physiological Bounds for Clinical Vitals:
+# ---------------------------------------------------
+# Sensors (especially optical PPG or BLE wristbands) occasionally report corrupted artifacts
+# (e.g., negative numbers, disconnected sensor zeros, or extreme spikes like HR = 999).
+# These bounds act as a defensive gate: if any vital is outside physiological bounds,
+# the reading is rejected from ML inference and handled safely by the rule fallback.
 _BOUNDS = {
-    "heartRate": (25, 220),
-    "spo2": (50, 100),
-    "systolicBP": (50, 220),
-    "diastolicBP": (30, 140),
-    "temperature": (32.0, 42.0),
+    "heartRate": (25, 220),       # bpm (bradycardia to extreme tachycardia)
+    "spo2": (50, 100),            # % oxygen saturation
+    "systolicBP": (50, 220),      # mmHg
+    "diastolicBP": (30, 140),     # mmHg
+    "temperature": (32.0, 42.0),  # Celsius (hypothermia to severe hyperpyrexia)
 }
 
 
 def extract_features(reading: HealthReadingCreate) -> np.ndarray | None:
-    """Return a clean feature vector, or None if the reading isn't safe to feed to the model."""
+    """Sanitizes raw vital readings into a clean 2D NumPy array for scikit-learn.
+    
+    Validation Checks:
+    1. Null check: Ensures all 5 mandatory vitals are present.
+    2. Type casting: Converts string or integer inputs to float.
+    3. Finite check: Rejects NaN (Not a Number) or +/- Infinity.
+    4. Bounds check: Verifies each measurement sits inside _BOUNDS.
+    
+    Returns:
+        np.ndarray of shape (1, 5) if valid, or None if reading fails sanitization.
+    """
     values = []
     for name in FEATURE_ORDER:
         value = getattr(reading, name, None)
@@ -36,3 +50,4 @@ def extract_features(reading: HealthReadingCreate) -> np.ndarray | None:
             return None
         values.append(value)
     return np.array([values], dtype=float)
+
