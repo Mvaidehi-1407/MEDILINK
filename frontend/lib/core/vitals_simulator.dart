@@ -37,6 +37,7 @@ class VitalsSimulatorEngine {
 
   int _spikeTicksRemaining = 0;
   String _spikeRegime = 'NORMAL';
+  int _tickCount = 0;
 
   /// Mean-Reverting Random Walk (Discrete Ornstein-Uhlenbeck process):
   /// Formula: next = current + drift_factor * (baseline - current) + gaussian_noise
@@ -49,20 +50,28 @@ class VitalsSimulatorEngine {
   }
 
   SimulatedVitals next() {
+    _tickCount++;
     if (_spikeTicksRemaining <= 0) {
-      // Stochastic Regime Transition:
-      // - 2% chance: Sudden HIGH_RISK spike (tachycardia + desaturation)
-      // - 6% chance: Moderate WARNING spike (exertion / mild fever)
-      // - 92% chance: Stable resting equilibrium
-      final roll = _random.nextDouble();
-      if (roll < 0.02) {
+      if (_tickCount % 5 == 0) {
+        // Deterministic HIGH_RISK spike every 5th reading, so an emergency trigger is
+        // reliably reproducible for testing/demo rather than left to a 2% dice roll.
         _spikeRegime = 'HIGH_RISK_SPIKE';
         _spikeTicksRemaining = 2 + _random.nextInt(3);
-      } else if (roll < 0.08) {
-        _spikeRegime = 'WARNING_SPIKE';
-        _spikeTicksRemaining = 2 + _random.nextInt(3);
       } else {
-        _spikeRegime = 'NORMAL';
+        // Stochastic Regime Transition on the remaining ticks:
+        // - 2% chance: Sudden HIGH_RISK spike (tachycardia + desaturation)
+        // - 6% chance: Moderate WARNING spike (exertion / mild fever)
+        // - 92% chance: Stable resting equilibrium
+        final roll = _random.nextDouble();
+        if (roll < 0.02) {
+          _spikeRegime = 'HIGH_RISK_SPIKE';
+          _spikeTicksRemaining = 2 + _random.nextInt(3);
+        } else if (roll < 0.08) {
+          _spikeRegime = 'WARNING_SPIKE';
+          _spikeTicksRemaining = 2 + _random.nextInt(3);
+        } else {
+          _spikeRegime = 'NORMAL';
+        }
       }
     }
 

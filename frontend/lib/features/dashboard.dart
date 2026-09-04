@@ -53,9 +53,44 @@ class RoleShell extends ConsumerStatefulWidget {
 
 class _RoleShellState extends ConsumerState<RoleShell> {
   int index = 0;
+  RealtimeConnection? _escalationConnection;
+  StreamSubscription? _escalationSubscription;
+  String? _escalationPatientId;
+
+  // The native SMS/call bridge must stay live for the entire patient session, not just while the
+  // Home tab happens to be visible -- RoleShell swaps `views[index]` in and out of the tree on
+  // every tab change (and pushed routes like the confirmation/simulator screens sit on top of
+  // this same shell), so a listener living inside one tab's widget gets disposed the moment the
+  // patient navigates away, silently dropping every escalation.attempt that arrives after that.
+  void _ensureEscalationListener(String? role, String patientId) {
+    if (role != 'PATIENT' || patientId.isEmpty) return;
+    if (_escalationPatientId == patientId && _escalationConnection != null) return;
+    _escalationSubscription?.cancel();
+    _escalationConnection?.dispose();
+    _escalationPatientId = patientId;
+    _escalationConnection = RealtimeService(ref.read(sessionProvider.notifier), ref.read(apiClientProvider)).patientChannel(patientId);
+    _escalationSubscription = _escalationConnection!.events.listen((event) {
+      if (event['event'] != 'escalation.attempt') return;
+      final data = Map<String, dynamic>.from(event['data'] as Map);
+      final emergencyId = data['emergencyId']?.toString();
+      if (emergencyId != null) {
+        NativeCommService().handleEscalationAttempt(ref.read(apiClientProvider), emergencyId, data);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _escalationSubscription?.cancel();
+    _escalationConnection?.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final role = ref.watch(sessionProvider).role;
+    final session = ref.watch(sessionProvider);
+    final role = session.role;
+    _ensureEscalationListener(role, session.userId);
     final views = role == 'PATIENT'
         ? [
             const PatientHome(),
@@ -246,15 +281,10 @@ class _PatientHomeState extends ConsumerState<PatientHome> {
     _connection = RealtimeService(ref.read(sessionProvider.notifier), ref.read(apiClientProvider)).patientChannel(patientId);
     // Live update reaches the UI with no manual refresh: any health.reading or
     // emergency.updated push from the backend invalidates the current-reading provider.
+    // escalation.attempt is handled globally by RoleShell (which outlives this tab), not here --
+    // see _RoleShellState._ensureEscalationListener.
     _subscription = _connection!.events.listen((event) {
       if (mounted) ref.invalidate(currentReadingProvider(patientId));
-      if (event['event'] == 'escalation.attempt') {
-        final data = Map<String, dynamic>.from(event['data'] as Map);
-        final emergencyId = data['emergencyId']?.toString();
-        if (emergencyId != null) {
-          NativeCommService().handleEscalationAttempt(ref.read(apiClientProvider), emergencyId, data);
-        }
-      }
     });
   }
 
@@ -523,6 +553,10 @@ class _SimulatorPageState extends ConsumerState<SimulatorPage> {
   bool streaming = false;
   Timer? _streamTimer;
   String? result;
+  // Guards against the periodic stream timer firing a new send while a confirmation page is
+  // already open for this emergency -- without this every subsequent 5s tick (still returning
+  // the same open emergency from the backend) would push a duplicate EmergencyPage on top.
+  String? _shownEmergencyId;
 
   @override
   void initState() {
@@ -605,6 +639,9 @@ class _SimulatorPageState extends ConsumerState<SimulatorPage> {
   }
 
   Future<void> _send() async {
+    // Don't fire a new reading while the previous one is still in flight, or while the
+    // confirmation page is already open for an emergency this loop just created.
+    if (sending || _shownEmergencyId != null) return;
     final v = preview ?? _engine.next();
     setState(() {
       sending = true;
@@ -629,8 +666,11 @@ class _SimulatorPageState extends ConsumerState<SimulatorPage> {
             'Backend accepted reading. Risk: ${(reading['risk'] as Map?)?['riskLevel'] ?? 'UNKNOWN'}${r['emergency'] == null ? '' : '. Emergency verification started.'}';
         preview = _engine.next();
       });
-      if (emergency != null && mounted && !streaming) {
-        await Navigator.of(context).push(MaterialPageRoute(builder: (_) => EmergencyPage(emergencyId: emergency['id'].toString())));
+      if (emergency != null && mounted) {
+        final emergencyId = emergency['id'].toString();
+        _shownEmergencyId = emergencyId;
+        await Navigator.of(context).push(MaterialPageRoute(builder: (_) => EmergencyPage(emergencyId: emergencyId)));
+        _shownEmergencyId = null;
       }
     } on ApiException catch (e) {
       if (mounted) setState(() => result = e.message);
@@ -726,7 +766,7 @@ class EmergencyPage extends ConsumerStatefulWidget {
 }
 
 class _EmergencyPageState extends ConsumerState<EmergencyPage> {
-  int seconds = 45;
+  int seconds = 30;
   Timer? timer;
   Timer? hapticTimer;
   bool busy = false;
@@ -734,6 +774,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
   String? message;
   String? callProviderMode;
   String? panicAttackType;
+  String? emergencyStatus;
   Timer? sosHoldTimer;
   double sosHoldProgress = 0;
   bool sosSending = false;
@@ -765,7 +806,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
   Future<void> _loadCountdownAndStart() async {
     // Reset from any previous emergency's countdown -- otherwise a leftover `seconds == 0` from
     // the last SOS would fire an immediate (and wrong) no-response on the very first tick here.
-    seconds = 45;
+    seconds = 30;
     try {
       final emergency = await ref.read(apiClientProvider).getEmergency(_activeId!);
       panicAttackType = emergency['panicAttackType']?.toString();
@@ -774,7 +815,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       // an invalid transition -- just show the resolved state.
       if (emergency['status'] != 'VERIFICATION') {
         resolved = true;
-        message = 'Emergency status: ${emergency['status']}';
+        emergencyStatus = emergency['status']?.toString();
       }
       final timeline = (emergency['timeline'] as List?) ?? const [];
       final verificationEvent = timeline.lastWhere(
@@ -848,7 +889,8 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       _sosEmergencyId = null;
       resolved = false;
       message = null;
-      seconds = 45;
+      emergencyStatus = null;
+      seconds = 30;
       sosHoldProgress = 0;
     });
   }
@@ -868,6 +910,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
           _sosEmergencyId = emergencyId;
           resolved = false;
           message = null;
+          emergencyStatus = null;
           loadingCountdown = true;
         });
         hapticTimer?.cancel();
@@ -910,15 +953,21 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
         }
       }
       final response = await ref.read(apiClientProvider).emergencyAction(_activeId!, action, body);
+      if (!mounted) return;
+      final status = response['status']?.toString();
+      if (action == 'cancel' && status == 'CANCELLED') {
+        // "I'm OK" means there's no active emergency to show anymore -- go straight back
+        // rather than making the patient dismiss a second "you're safe" screen themselves.
+        _backToHome();
+        return;
+      }
       // VERIFICATION is the only status the confirm/cancel buttons apply to -- once it moves on
       // (CONFIRMED/CANCELLED/etc), stop offering actions that the backend will now correctly
       // reject as an invalid transition.
-      if (mounted) {
-        setState(() {
-          message = 'Emergency status: ${response['status']}';
-          resolved = response['status'] != 'VERIFICATION';
-        });
-      }
+      setState(() {
+        emergencyStatus = status;
+        resolved = status != 'VERIFICATION';
+      });
     } on ApiException catch (error) {
       if (mounted) setState(() => message = error.message);
     } finally {
@@ -1044,36 +1093,68 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       Padding(padding: const EdgeInsets.only(top: 16), child: Text(message!)),
   ];
 
-  List<Widget> _resolvedContent(BuildContext context) => [
-    const Icon(Icons.emergency, size: 82, color: MedilinkColors.red),
-    const SizedBox(height: 20),
-    Text(
-      'EMERGENCY CONFIRMED',
-      style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900, color: MedilinkColors.red),
-    ),
-    const SizedBox(height: 20),
-    SectionCard(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            const Icon(Icons.check_circle, color: MedilinkColors.teal, size: 40),
-            const SizedBox(height: 8),
-            Text(
-              message ?? 'Emergency confirmed. Caretakers are being contacted.',
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontWeight: FontWeight.w700),
-            ),
-          ],
+  /// The confirmation screen's outcome depends entirely on which status the emergency actually
+  /// landed in -- a safe outcome (CANCELLED/RESOLVED) must never look identical to an active one
+  /// (CONFIRMED/HOSPITAL_ESCALATED) that's still calling caretakers.
+  static const _safeStatuses = {'CANCELLED', 'RESOLVED'};
+
+  List<Widget> _resolvedContent(BuildContext context) {
+    final isSafe = _safeStatuses.contains(emergencyStatus);
+    final color = isSafe ? MedilinkColors.teal : MedilinkColors.red;
+    final (icon, title, body) = switch (emergencyStatus) {
+      'CANCELLED' => (
+          Icons.check_circle,
+          "You're marked safe",
+          'You confirmed you\'re OK. No caretakers were contacted for this alert.',
+        ),
+      'RESOLVED' => (
+          Icons.check_circle,
+          'Vitals back to normal',
+          'Your readings returned to a normal range while under monitoring, so this alert was closed automatically.',
+        ),
+      'HOSPITAL_ESCALATED' => (
+          Icons.local_hospital,
+          'Escalated to hospital',
+          'No caretaker acknowledged in time, so the nearest hospital command center has been notified with your location.',
+        ),
+      _ => (
+          Icons.emergency,
+          'EMERGENCY CONFIRMED',
+          'Caretakers are being called and texted from this device. Keep it on and connected.',
+        ),
+    };
+    return [
+      Icon(icon, size: 82, color: color),
+      const SizedBox(height: 20),
+      Text(
+        title,
+        textAlign: TextAlign.center,
+        style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900, color: color),
+      ),
+      const SizedBox(height: 20),
+      SectionCard(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              Icon(isSafe ? Icons.check_circle : Icons.info_outline, color: isSafe ? MedilinkColors.teal : MedilinkColors.amber, size: 40),
+              const SizedBox(height: 8),
+              Text(body, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
+              if (message != null && message != body) ...[
+                const SizedBox(height: 8),
+                Text(message!, textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ],
+          ),
         ),
       ),
-    ),
-    const SizedBox(height: 12),
-    OutlinedButton(
-      onPressed: _backToHome,
-      child: const Text('Back to home'),
-    ),
-  ];
+      const SizedBox(height: 12),
+      OutlinedButton(
+        onPressed: _backToHome,
+        child: const Text('Back to home'),
+      ),
+    ];
+  }
 }
 
 class EmergencyList extends ConsumerStatefulWidget {

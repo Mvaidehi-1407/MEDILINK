@@ -77,8 +77,10 @@ class EmergencyService:
     async def route_reading(self, reading: dict, risk: RiskResult, panic: PanicAssessment) -> dict | None:
         """Entry point called from every /api/health reading. Motion-aware fusion (20.3):
         abnormal+motion -> Supervision Mode; abnormal+no/unknown motion -> straight to Patient
-        Confirmation. Never fabricates a route for a normal/non-panic reading."""
-        is_abnormal = risk.riskLevel.value == "HIGH_RISK" or panic.panic_pattern_detected
+        Confirmation. Never fabricates a route for a normal/non-panic reading. Triggers on
+        WARNING and HIGH_RISK readings only -- NORMAL never opens the emergency page, regardless
+        of what the panic engine's pattern classifier reports."""
+        is_abnormal = risk.riskLevel.value in ("WARNING", "HIGH_RISK")
         existing = await self.emergencies.find_one({"patientId": reading["patientId"], "status": {"$in": _OPEN_STATUSES}})
 
         if existing and existing["status"] == EmergencyStatus.SUPERVISION.value:
@@ -143,7 +145,7 @@ class EmergencyService:
         elapsed = elapsed_since(emergency.get("supervisionStartedAt"), now)
         timeout = timedelta(minutes=self.settings.supervision_timeout_minutes)
 
-        if risk.riskLevel.value != "HIGH_RISK":
+        if risk.riskLevel.value == "NORMAL":
             updated = await self._transition(emergency, EmergencyStatus.RESOLVED, {"reason": "vitals_normalized"}, {"supervisionResolvedAt": now})
             await self._log(emergency["id"], emergency["patientId"], "supervisionResolvedNormalized", updated)
             return updated
