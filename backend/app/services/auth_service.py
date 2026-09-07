@@ -88,14 +88,14 @@ class AuthService:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
         return payload
 
-    async def _is_jti_revoked(self, jti: str) -> bool:
-        return await self.db.revoked_refresh_tokens.find_one({"_id": jti}) is not None
-
     async def _revoke_jti(self, jti: str, exp: int) -> None:
-        if await self._is_jti_revoked(jti):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token already used or revoked")
         expires_at = datetime.fromtimestamp(exp, tz=utcnow().tzinfo)
-        await self.db.revoked_refresh_tokens.insert_one({"_id": jti, "expiresAt": expires_at})
+        # The unique _id insert is the lock: a pre-read check would let two concurrent refreshes
+        # of the same token both pass before either wrote.
+        try:
+            await self.db.revoked_refresh_tokens.insert_one({"_id": jti, "expiresAt": expires_at})
+        except DuplicateKeyError:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token already used or revoked")
 
     def _auth_response(self, user: dict) -> AuthResponse:
         access, expires_at = create_token(user["id"], "access", self.settings.access_token_expire_minutes, {"role": user["role"]})

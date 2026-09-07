@@ -1,0 +1,463 @@
+================================================================================
+                          MEDILINK CODEBASE AUDIT
+================================================================================
+
+Audit date: 2026-09-07
+Branch: main
+Scope: Full-repository audit of the real vs demo/partial emergency pipeline.
+Method: Inspection only. No files were modified, created, or deleted during the
+        audit itself. Model artifacts were load-tested read-only.
+
+Repo layout (discovered):
+  backend/                    FastAPI + Motor/MongoDB, 82 app files
+  frontend/                   Flutter, 19 lib files + Android native Kotlin
+  backend/app/risk/model/     2 trained .joblib artifacts
+  No firmware/hardware directory exists anywhere.
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+The backend is a genuinely well-built, event-based emergency system. The ENTIRE
+SENSOR HALF of the pipeline does not exist -- there is no ESP32 firmware, and BLE
+never produces a single vital. Every vital in the system today comes from a Dart
+random-walk generator. Native Android calling is real, but it is unreachable
+after the first emergency because no client ever closes an emergency.
+
+Approximate completion: ~55%
+  - backend / ML / calling ......... ~85%
+  - sensor + BLE ingestion ......... ~5%
+
++---------------------+-----------+------------+------------------------------------------------------------+
+| Component           | Status    | Confidence | Key Evidence                                               |
++---------------------+-----------+------------+------------------------------------------------------------+
+| Real Vitals         | MISSING   | HIGH       | Only source is frontend/lib/core/vitals_simulator.dart:52   |
+|                     |           |            | next() random walk                                         |
++---------------------+-----------+------------+------------------------------------------------------------+
+| BLE                 | PARTIAL   | HIGH       | frontend/lib/features/dashboard.dart:699-710 scans only;    |
+|                     |           |            | no discoverServices anywhere                               |
++---------------------+-----------+------------+------------------------------------------------------------+
+| AI/ML               | REAL      | HIGH       | GBC artifacts load + infer correctly; verified live         |
++---------------------+-----------+------------+------------------------------------------------------------+
+| Emergency Trigger   | REAL      | HIGH       | backend/app/services/emergency_service.py:77                |
+|                     |           |            | route_reading()                                            |
++---------------------+-----------+------------+------------------------------------------------------------+
+| Emergency Event     | REAL      | HIGH       | Per-document MongoDB insert,                               |
+|                     |           |            | backend/app/services/emergency_service.py:112               |
++---------------------+-----------+------------+------------------------------------------------------------+
+| Emergency Contact   | REAL      | HIGH       | backend/app/services/emergency_service.py:256               |
+|                     |           |            | _ordered_caretakers() by patientId                          |
++---------------------+-----------+------------+------------------------------------------------------------+
+| Native Calling      | REAL      | HIGH       | frontend/android/app/src/main/kotlin/com/example/medilink/  |
+|                     |           |            | MainActivity.kt:81  Intent.ACTION_CALL                      |
++---------------------+-----------+------------+------------------------------------------------------------+
+| Repeat Emergencies  | BROKEN    | HIGH       | emergency_service.py:88-90 + /resolve has zero callers      |
++---------------------+-----------+------------+------------------------------------------------------------+
+
+TOP 5 BLOCKERS
+  1. No ESP32 firmware.
+  2. BLE never ingests data.
+  3. Open emergency permanently blocks all future AI emergencies.
+  4. motion never sent, disabling supervision routing.
+  5. Hospital-stage calls are DEMO_RECORDED.
+
+TOP 5 FILES
+  1. backend/app/services/emergency_service.py
+  2. frontend/lib/features/dashboard.dart
+  3. frontend/android/app/src/main/kotlin/com/example/medilink/MainActivity.kt
+  4. backend/app/risk/hybrid_engine.py
+  5. frontend/lib/core/vitals_simulator.dart
+
+
+================================================================================
+2. VITALS + BLE AUDIT
+================================================================================
+
+flutter_blue_plus: ^2.1.0 is declared (frontend/pubspec.yaml:38) and imported in
+exactly one file. Outside that, every flutter_blue_plus hit in the repo is in
+generated .dart_tool/ registrant code.
+
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| File:Line                      | Function          | Status  | Conf | Evidence                                 | Required Change                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| frontend/lib/core/             | next()            | DEMO    | HIGH | Ornstein-Uhlenbeck random walk;          | Replace as vitals source once  |
+| vitals_simulator.dart:52       |                   |         |      | _tickCount % 5 == 0 forces a             | BLE lands                      |
+|                                |                   |         |      | deterministic HIGH_RISK spike (L55-59)   |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| frontend/lib/features/         | _BlePageState     | PARTIAL | HIGH | FlutterBluePlus.scanResults.listen only  | Add discoverServices +         |
+| dashboard.dart:699-710         | .scan()           |         |      | populates a UI list                      | characteristic subscribe       |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| frontend/lib/features/         | Connect button    | BROKEN  | HIGH | d.device.connect(...) is fire-and-forget  | Persist connection, read GATT  |
+| dashboard.dart:750             |                   |         |      | -- return value discarded, no service    | characteristics                |
+|                                |                   |         |      | discovery, no listener, no state kept    |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| frontend/lib/features/         | _send()           | DEMO    | HIGH | Only caller of submitReading; hardcodes  | Add a real BLE-sourced submit  |
+| dashboard.dart:651-660         |                   |         |      | 'deviceId': 'development-simulator',     | path                           |
+|                                |                   |         |      | 'source': 'DEMO'                         |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| (none)                         | ESP32 firmware    | MISSING | HIGH | Zero .ino/.cpp/PlatformIO files; ESP32   | Write firmware                 |
+|                                |                   |         |      | appears only in Audit.txt                |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+
+WHERE VITALS ORIGINATE
+Exclusively VitalsSimulatorEngine, gated behind Dev Mode (devModeEnabled,
+default false, frontend/lib/core/session.dart:72). With Dev Mode off -- the
+default -- NO VITALS ENTER THE SYSTEM AT ALL.
+
+FastAPI does receive and persist these values for real:
+backend/app/services/health_service.py:38 inserts into health_readings.
+Database records are real documents; the CONTENT is simulated. Seeded data is
+hospitals-only, explicitly "demo": True
+(backend/app/services/seed_service.py:6-33). No random or hard-coded vitals
+exist on the backend.
+
+
+================================================================================
+3. AI / ML AUDIT
+================================================================================
+
+STATUS: REAL -- CONFIDENCE: HIGH
+
+Two trained GradientBoostingClassifier artifacts exist and were verified by
+loading and running inference:
+
+  risk_model.joblib   (235KB)
+      version:  risk-gbc-v1.0-2026-09-03
+      features: [heartRate, spo2, systolicBP, diastolicBP, temperature]  (5)
+      holdout accuracy: 0.9794
+
+  panic_model.joblib  (1.0MB)
+      version:  panic-gbc-v2.0-2026-09-03
+      features: [heartRate, spo2, systolicBP, diastolicBP, temperature,
+                 motionActive, isNighttime, hasTrigger, priorEpisodeCount]  (9)
+      classes:  6
+      holdout accuracy: 0.96
+
+LIVE INFERENCE CHECK (run read-only during this audit):
+  [72, 98, 118, 78, 36.8]     -> NORMAL     (0.99)
+  [150, 85, 178, 108, 39.4]   -> HIGH_RISK  (0.99)
+  [119, 93, 148, 91, 38.1]    -> WARNING    (0.977)
+
+The model is genuinely called on every reading --
+backend/app/risk/hybrid_engine.py:80 runs predict in a thread pool under a 2.0s
+timeout, with a deterministic rule fallback (backend/app/risk/risk_service.py).
+engineUsed honestly records "ML" vs "RULE_FALLBACK"
+(backend/app/services/health_service.py:28), and the frontend displays the real
+backend value (frontend/lib/features/dashboard.dart:395).
+
+CRITICAL DISTINCTION
+The model IS connected to the live ingestion path -- but the vitals flowing
+through it are simulated. Both models' own metadata is candid:
+  dataset_source: "synthetic, generated in app/risk/train_model.py
+                   (not real patient data)"
+
+Thresholds in backend/app/config.py:41-50 govern only the fallback engine, not
+the ML path. No random or demo risk values anywhere.
+
+PANIC MODEL GAP -- STATUS: PARTIAL, CONFIDENCE: HIGH
+It consumes motionActive, but reading.motion is Optional
+(backend/app/schemas/health.py:29) and NO FLUTTER CODE EVER SENDS IT (zero
+motion payload hits in frontend/lib/). So motion_state is permanently UNKNOWN
+(backend/app/risk/panic_engine.py:74), and route_to_supervision (line 80,
+requires MotionState.ACTIVE) CAN NEVER BE TRUE. Supervision Mode is dead code
+in practice.
+
+
+================================================================================
+4. EMERGENCY / SOS AUDIT
+================================================================================
+
+THE IMPLEMENTATION IS CORRECTLY EVENT-BASED, NOT GLOBAL/STATIC.
+
+Each emergency is its own MongoDB document with its own callStatus,
+escalationCycle, escalationPriority, and timeline
+(backend/app/services/emergency_service.py:119-141). There are NO hasCalled
+flags, NO module-level mutable call state, NO cooldowns. State transitions are
+validated by a real state machine (backend/app/emergency/state_machine.py:21).
+Manual SOS, confirmation, cancellation, no-response, acknowledgment and
+escalation are all implemented and persisted.
+
+WHY THE CALL WORKS ONLY ONCE -- STATUS: BROKEN, CONFIDENCE: HIGH
+The cause is NOT global state; it is a lifecycle leak:
+
+  1. _OPEN_STATUSES (emergency_service.py:24) counts everything except
+     CANCELLED/RESOLVED as open -- including CONFIRMED, ACKNOWLEDGED,
+     RESPONDING.
+
+  2. route_reading (emergency_service.py:88-90) returns the existing emergency
+     and refuses to create a new one whenever any open emergency exists.
+
+  3. POST /emergencies/{id}/resolve exists (backend/app/api/emergencies.py:96)
+     but HAS ZERO CALLERS in frontend/lib/. A grep for /resolve and resolve'
+     across the whole Flutter tree found none. Nothing auto-resolves either:
+     sweep_time_based_transitions (emergency_service.py:165) only escalates,
+     never closes.
+
+Once one emergency reaches CONFIRMED, that patient can NEVER trigger another AI
+emergency -- permanently, across restarts, because it is persisted.
+
+INCONSISTENCY
+Manual SOS uses create() (emergency_service.py:42), which has NO dedup check, so
+manual SOS spawns unlimited overlapping open emergencies -- the opposite
+failure.
+
+
+================================================================================
+5. NATIVE CALLING AUDIT
+================================================================================
+
+NO TWILIO. Only empty EXOTEL_* / PLIVO_* keys remain in backend/.env; no SDK or
+HTTP call exists. Architecture: the backend never dials -- it relays over
+WebSocket to the patient's own device, which calls over its own SIM.
+
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| File:Line                      | Function          | Status  | Conf | Evidence                                 | Required Change                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| frontend/android/app/src/main/ | placeCall()       | REAL    | HIGH | Intent(ACTION_CALL, "tel:$phone") +      | None                           |
+| kotlin/com/example/medilink/   |                   |         |      | startActivity; checks CALL_PHONE grant   |                                |
+| MainActivity.kt:70-90          |                   |         |      | and SIM_STATE_READY; returns INITIATED,  |                                |
+|                                |                   |         |      | never a fabricated success               |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| frontend/android/app/src/main/ | (permissions)     | REAL    | HIGH | CALL_PHONE, SEND_SMS, READ_PHONE_STATE   | None                           |
+| AndroidManifest.xml:8-10       |                   |         |      | declared                                 |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| frontend/lib/core/             | placeCall()       | REAL    | HIGH | Permission.phone.request() runtime       | None                           |
+| native_comm_service.dart:28    |                   |         |      | prompt before MethodChannel invoke       |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| backend/app/services/          | relay_to_patient  | PARTIAL | HIGH | Returns NO_DEVICE_CONNECTED if no live   | Add FCM high-priority wake     |
+| calling_service.py:44          | _device()         |         |      | WS -- honest, but calls fail silently    |                                |
+|                                |                   |         |      | whenever the app is closed/backgrounded  |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+| backend/app/integrations/      | DemoCallProvider  | DEMO    | HIGH | Returns "status": "DEMO_RECORDED",       | Real provider or documented    |
+| calling_provider.py:28         | .place_call()     |         |      | "demo": True -- used for Stage-2         | scope cut                      |
+|                                |                   |         |      | hospital calls via _call_hospitals:403   |                                |
++--------------------------------+-------------------+---------+------+------------------------------------------+--------------------------------+
+
+url_launcher is declared in pubspec but UNUSED -- calling goes through the
+MethodChannel, which is the stronger implementation (ACTION_CALL dials directly;
+ACTION_DIAL would not).
+
+Phone numbers are NEVER hard-coded: the number comes from contacts[0]['phone']
+for the logged-in patientId. The call IS tied to the emergency (emergencyId on
+every attempt, results recorded via /comm-result), and the escalation loop is
+per-event with cycle/priority -- so repeat calls are architecturally sound and
+blocked ONLY by the unresolved-emergency bug in section 4.
+
+
+================================================================================
+6. AUTH + CONTACT + DATABASE AUDIT
+================================================================================
+
+CHAIN VERIFIED END-TO-END -- STATUS: REAL, CONFIDENCE: HIGH
+
+No hard-coded user IDs, no hard-coded phone numbers (only E.164 format hints in
+validators), no demo accounts, no fake patients, no auth bypasses.
+
+patientId always comes from the live session:
+  frontend/lib/core/session.dart:26   userId => user?['id']
+  restored from FlutterSecureStorage on boot (session.dart:60)
+  -- NO missing-user-ID-after-restore issue.
+
+Contacts are scoped by patientId on every read/write with ownership checks
+(backend/app/api/contacts.py:21, :44, :58), and role authorization is enforced
+via assert_owner_or_roles (backend/app/api/health.py:17).
+
+UNCOMMITTED CHANGE IN auth_service.py -- CORRECT FIX
+It replaces a check-then-insert TOCTOU race on refresh-token revocation with an
+atomic unique-_id insert catching DuplicateKeyError. Import is present
+(backend/app/services/auth_service.py:5) and the removed _is_jti_revoked has no
+remaining references -- not broken.
+
+FCM -- STATUS: PARTIAL
+Code is real (backend/app/integrations/notification_provider.py:47), but
+FCM_SERVICE_ACCOUNT_JSON= is empty in .env, so get_notification_provider returns
+DemoNotificationProvider -> DEMO_RECORDED. Implemented and connected, NOT
+CURRENTLY EXECUTING.
+
+
+================================================================================
+7. END-TO-END STATUS
+================================================================================
+
++----------------------------+---------+--------------------------------------------------------+
+| Stage                      | Status  | Evidence                                               |
++----------------------------+---------+--------------------------------------------------------+
+| ESP32 sensors              | MISSING | No firmware files exist                                |
++----------------------------+---------+--------------------------------------------------------+
+| BLE transmission           | MISSING | No GATT read/subscribe anywhere                        |
++----------------------------+---------+--------------------------------------------------------+
+| Flutter vitals reception   | DEMO    | VitalsSimulatorEngine only                             |
++----------------------------+---------+--------------------------------------------------------+
+| FastAPI ingestion          | REAL    | /health/readings validates + persists                  |
++----------------------------+---------+--------------------------------------------------------+
+| ML inference               | REAL    | GBC verified loading and predicting                    |
++----------------------------+---------+--------------------------------------------------------+
+| Emergency creation         | REAL    | Per-document Mongo insert                              |
++----------------------------+---------+--------------------------------------------------------+
+| Confirmation/escalation    | PARTIAL | Real countdown/stages; Supervision unreachable         |
+|                            |         | (motion never sent)                                    |
++----------------------------+---------+--------------------------------------------------------+
+| Contact retrieval          | REAL    | Priority-ordered by patientId                          |
++----------------------------+---------+--------------------------------------------------------+
+| Native call                | REAL    | ACTION_CALL, but only while app holds a live WS        |
++----------------------------+---------+--------------------------------------------------------+
+| Repeat emergencies         | BROKEN  | Open emergency blocks forever                          |
++----------------------------+---------+--------------------------------------------------------+
+
+
+================================================================================
+8. PRIORITY CHANGES
+================================================================================
+
+--------------------------------------------------------------------------------
+P0 -- MUST FIX
+--------------------------------------------------------------------------------
+
+1. backend/app/services/emergency_service.py -> route_reading
+   PROBLEM:  An unresolved CONFIRMED emergency permanently blocks every future
+             AI emergency.
+   EVIDENCE: emergency_service.py:88-90; /resolve has zero Flutter callers.
+   CHANGE:   Wire a resolve/close action (and/or auto-resolve on sustained
+             NORMAL).
+
+2. (missing) ESP32 firmware
+   PROBLEM:  No sensor code exists.
+   EVIDENCE: Zero .ino/.cpp/PlatformIO files in the repository.
+   CHANGE:   Add firmware exposing HR/SpO2/BP/temp over a GATT characteristic.
+
+3. frontend/lib/features/dashboard.dart -> _BlePageState
+   PROBLEM:  connect() result discarded, no discoverServices/subscribe.
+   EVIDENCE: dashboard.dart:750.
+   CHANGE:   Build a real BLE service that parses notifications and POSTs to
+             /api/health with source: BLE.
+
+4. backend/app/services/emergency_service.py -> create
+   PROBLEM:  Manual SOS has no open-emergency check, allowing unlimited
+             duplicates.
+   EVIDENCE: emergency_service.py:42.
+   CHANGE:   Apply the same guard route_reading uses.
+
+5. backend/app/services/calling_service.py -> relay_to_patient_device
+   PROBLEM:  A real emergency silently fails as NO_DEVICE_CONNECTED when the app
+             isn't foregrounded.
+   EVIDENCE: calling_service.py:47.
+   CHANGE:   Populate FCM credentials and wake the device before relaying.
+
+--------------------------------------------------------------------------------
+P1 -- SHOULD FIX
+--------------------------------------------------------------------------------
+
+1. Flutter vitals submit
+   PROBLEM:  motion never sent, so route_to_supervision is unreachable and the
+             panic model runs on a constant feature.
+   EVIDENCE: backend/app/risk/panic_engine.py:80.
+   CHANGE:   Send accelerometer state.
+
+2. backend/app/integrations/calling_provider.py -> DemoCallProvider
+   PROBLEM:  Stage-2 hospital calls return DEMO_RECORDED.
+   EVIDENCE: calling_provider.py:39.
+   CHANGE:   Route through the device relay or cut from scope explicitly.
+
+3. frontend/lib/core/vitals_simulator.dart -> next()
+   PROBLEM:  Deterministic spike every 5th tick is demo-shaped, not
+             physiological.
+   EVIDENCE: vitals_simulator.dart:55.
+   CHANGE:   Keep strictly behind Dev Mode.
+
+4. backend/app/risk/train_model.py
+   PROBLEM:  Models trained on synthetic data only.
+   EVIDENCE: dataset_source metadata in both .joblib bundles.
+   CHANGE:   Label as decision-support, not diagnosis.
+
+5. frontend/pubspec.yaml
+   PROBLEM:  url_launcher declared but unused.
+   EVIDENCE: Zero url_launcher references in frontend/lib/.
+   CHANGE:   Drop it.
+
+
+================================================================================
+9. FINAL VERDICT
+================================================================================
+
++--------------------------------------------+-------------------------------------+------------+
+| Question                                   | Verdict                             | Confidence |
++--------------------------------------------+-------------------------------------+------------+
+| Real wearable vitals?                      | NO                                  | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Real BLE?                                  | PARTIAL (scan/connect only, no data)| HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Real AI model?                             | YES                                 | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| AI connected to live vitals?               | PARTIAL (real path, simulated data) | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Real emergency event?                      | YES                                 | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Correct logged-in patient?                 | YES                                 | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Correct emergency contact?                 | YES                                 | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Real native phone call?                    | YES (device-side, app must be live) | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Repeat emergency calls?                    | NO                                  | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Full pipeline without demo/mock data?      | NO                                  | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+| Production-ready?                          | NO                                  | HIGH       |
++--------------------------------------------+-------------------------------------+------------+
+
+
+================================================================================
+10. MINIMUM PATH TO REAL SYSTEM
+================================================================================
+
+ 1. ESP32 FIRMWARE (new)
+    MAX30102 + BMP/temp sensor, expose vitals as a GATT characteristic.
+
+ 2. BLE TRANSMISSION
+    Standard notify characteristic, JSON or packed struct.
+
+ 3. FLUTTER RECEPTION (new core/ble_service.dart)
+    Persistent connection, discoverServices, subscribe, parse; replace the
+    discard-on-connect in frontend/lib/features/dashboard.dart:750.
+
+ 4. FASTAPI INGESTION
+    No change needed; post to /health/readings with source: BLE and include
+    motion.
+
+ 5. ML INFERENCE
+    No change needed.
+
+ 6. EMERGENCY CREATION
+    No change needed.
+
+ 7. CONFIRMATION / ESCALATION
+    Send motion to unlock Supervision Mode.
+
+ 8. CONTACT RETRIEVAL
+    No change needed.
+
+ 9. NATIVE CALL
+    No change needed; add FCM wake so a backgrounded app still relays.
+
+10. REPEAT-EMERGENCY FIX
+    Wire /resolve in Flutter + add the dedup guard to create() (P0 #1, #4).
+    THIS IS THE SINGLE HIGHEST-VALUE CHANGE.
+
+11. END-TO-END VALIDATION
+    Trigger three consecutive emergencies on one account, confirming three
+    distinct emergencyIds and three real calls.
+
+
+================================================================================
+BOTTOM LINE
+================================================================================
+
+The backend, ML, state machine, and native calling are genuinely real and
+honestly labeled -- the codebase does not fake success anywhere that was
+checked. What's missing is the entire hardware/BLE input half, and one lifecycle
+bug that makes the real calling path fire exactly once per patient forever.
+
+================================================================================
+                              END OF REPORT
+================================================================================
