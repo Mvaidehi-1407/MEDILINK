@@ -1209,6 +1209,33 @@ class _EmergencyListState extends ConsumerState<EmergencyList> {
     }
   }
 
+  /// Closing an emergency isn't only bookkeeping: while one stays open the backend won't raise a
+  /// new emergency for that patient, so the confirmation spells that out rather than presenting
+  /// this as a cosmetic "mark done".
+  Future<void> _resolve(String emergencyId) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Resolve this emergency?'),
+        content: const Text(
+          'This closes the event for good. Until it is closed, this patient cannot be alerted '
+          'for a new emergency. Only resolve it once the situation has actually been handled.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(c).pop(false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.of(c).pop(true), child: const Text('Resolve')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await ref.read(apiClientProvider).resolveEmergency(emergencyId, notes: 'Resolved from hospital command center.');
+      _load();
+    } on ApiException catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final role = ref.read(sessionProvider).role;
@@ -1253,6 +1280,10 @@ class _EmergencyListState extends ConsumerState<EmergencyList> {
               final canAcknowledge = role == 'CAREGIVER' &&
                   e['escalationStage'] == 'CONTACT_NOTIFIED' &&
                   e['contactAcknowledgedAt'] == null;
+              // Mirrors the backend: /resolve is hospital-only, and the state machine allows
+              // RESOLVED only from these three statuses.
+              final canResolve = role == 'HOSPITAL' &&
+                  const {'CONFIRMED', 'ACKNOWLEDGED', 'RESPONDING'}.contains(e['status'].toString());
               return Padding(
                 padding: const EdgeInsets.only(bottom: 10),
                 child: SectionCard(
@@ -1291,6 +1322,15 @@ class _EmergencyListState extends ConsumerState<EmergencyList> {
                             onPressed: () => _acknowledge(e['id'].toString()),
                             icon: const Icon(Icons.check_circle_outline),
                             label: const Text('Acknowledge alert'),
+                          ),
+                        ),
+                      if (canResolve)
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton.icon(
+                            onPressed: () => _resolve(e['id'].toString()),
+                            icon: const Icon(Icons.task_alt),
+                            label: const Text('Resolve emergency'),
                           ),
                         ),
                     ],

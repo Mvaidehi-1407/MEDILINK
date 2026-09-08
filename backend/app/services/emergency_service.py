@@ -26,6 +26,17 @@ _OPEN_STATUSES = [
     if s not in {EmergencyStatus.CANCELLED, EmergencyStatus.RESOLVED}
 ]
 
+# Statuses an emergency may be auto-closed from once the patient's vitals have stayed NORMAL for
+# long enough. VERIFICATION is deliberately excluded: that is a live countdown waiting on the
+# patient's own answer, and it ends through cancel()/confirm() -- never silently behind their
+# back. SUPERVISION is excluded too because _update_supervision() already resolves it on the
+# first NORMAL reading.
+_AUTO_RESOLVABLE_STATUSES = {
+    EmergencyStatus.CONFIRMED.value,
+    EmergencyStatus.ACKNOWLEDGED.value,
+    EmergencyStatus.RESPONDING.value,
+}
+
 
 class EmergencyService:
     def __init__(self, db: AsyncIOMotorDatabase, settings: Settings | None = None):
@@ -87,7 +98,9 @@ class EmergencyService:
             return await self._update_supervision(existing, reading, risk)
         if existing:
             # Already mid-flow (verification/confirmed/etc) -- don't spawn a duplicate emergency.
-            return existing
+            # An emergency nobody ever closes would block this patient's next one forever, so a
+            # sustained run of NORMAL readings closes it out here (see _track_recovery).
+            return await self._track_recovery(existing, is_abnormal)
         if not is_abnormal:
             return None
 
@@ -136,9 +149,49 @@ class EmergencyService:
             "escalationStage": escalation_stage.value,
             "autoEscalated": False,
             "contactNotifiedAt": None,
+            # Recovery streak driving auto-resolve; reset by any abnormal reading.
+            "consecutiveNormalReadings": 0,
+            "autoResolved": False,
             "createdAt": now,
             "updatedAt": now,
         }
+
+    async def _track_recovery(self, emergency: dict, is_abnormal: bool) -> dict | None:
+        """Counts consecutive NORMAL readings against a still-open emergency and closes it once
+        the patient has been stable for `auto_resolve_normal_readings` in a row.
+
+        Without this, an emergency that nobody explicitly resolves stays open forever and
+        route_reading() keeps handing that same stale event back -- so the patient could never
+        trigger a second emergency again, permanently, because the open event is persisted. Any
+        abnormal reading resets the streak, so a patient who is still unwell is never closed out.
+        """
+        if is_abnormal:
+            if emergency.get("consecutiveNormalReadings"):
+                return await self.emergencies.update(
+                    emergency["id"], {"$set": {"consecutiveNormalReadings": 0, "updatedAt": utcnow()}},
+                )
+            return emergency
+
+        streak = (emergency.get("consecutiveNormalReadings") or 0) + 1
+        if streak < self.settings.auto_resolve_normal_readings or emergency["status"] not in _AUTO_RESOLVABLE_STATUSES:
+            # Still recovering, or in a stage only the patient/hospital may close.
+            return await self.emergencies.update(
+                emergency["id"], {"$set": {"consecutiveNormalReadings": streak, "updatedAt": utcnow()}},
+            )
+
+        resolved = await self._transition(
+            emergency, EmergencyStatus.RESOLVED,
+            {"reason": "vitals_normalized", "consecutiveNormalReadings": streak},
+            {"consecutiveNormalReadings": streak, "autoResolved": True},
+        )
+        await self._log(emergency["id"], emergency["patientId"], "autoResolvedNormalized", resolved)
+        logger.info(
+            "Emergency %s auto-resolved after %d consecutive NORMAL readings; patient %s can open a new emergency again.",
+            emergency["id"], streak, emergency["patientId"],
+        )
+        # None, not the closed event: the app must not reopen a confirmation page for an
+        # emergency that just ended.
+        return None
 
     async def _update_supervision(self, emergency: dict, reading: dict, risk: RiskResult) -> dict:
         now = utcnow()

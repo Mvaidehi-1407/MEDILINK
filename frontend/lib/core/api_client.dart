@@ -75,7 +75,20 @@ class ApiClient {
     }
   }
 
-  Future<bool> _refreshTokens() async {
+  // Refresh tokens are single-use server-side (rotation/replay protection), so two concurrent
+  // callers racing to refresh the same token would otherwise see one 200 and one 401 -- and
+  // without this guard, that losing 401 would wipe out the *winning* call's freshly-stored
+  // session (see _request's 401 handler below), logging the user out right after a successful
+  // login/refresh. Coalescing every concurrent call onto a single in-flight request means they
+  // all see the same (successful) outcome instead of racing the one-time-use token against
+  // each other.
+  Future<bool>? _refreshInFlight;
+
+  Future<bool> _refreshTokens() {
+    return _refreshInFlight ??= _doRefresh().whenComplete(() => _refreshInFlight = null);
+  }
+
+  Future<bool> _doRefresh() async {
     final refresh = _session.refreshToken;
     if (refresh == null) return false;
     try {
@@ -191,6 +204,15 @@ class ApiClient {
       Map<String, dynamic>.from(await post('/emergencies/$emergencyId/acknowledge-contact') as Map);
   Future<Map<String, dynamic>> getEmergency(String id) async =>
       Map<String, dynamic>.from(await get('/emergencies/$id') as Map);
+
+  /// Closes an emergency for good (hospital accounts only, per the backend's role check).
+  /// An emergency left open blocks every future emergency for that patient, since the backend
+  /// won't open a second one while one is still active -- so resolving is what frees the patient
+  /// to be alerted again, not just a tidy-up action.
+  Future<Map<String, dynamic>> resolveEmergency(String emergencyId, {String? notes}) async =>
+      Map<String, dynamic>.from(await post('/emergencies/$emergencyId/resolve', body: {
+        if (notes != null && notes.isNotEmpty) 'resolutionNotes': notes,
+      }) as Map);
   Future<Map<String, dynamic>> createManualSos(String patientId) async =>
       Map<String, dynamic>.from(await post('/emergencies', body: {
         'patientId': patientId,

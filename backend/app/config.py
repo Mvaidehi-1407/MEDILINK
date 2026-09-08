@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     # alert -- so a brief connectivity race doesn't cost the full re-ping interval before the
     # same caretaker gets a genuine attempt.
     caretaker_reconnect_retry_seconds: int = 15
+    # How many consecutive NORMAL readings close an emergency that nobody explicitly resolved.
+    # An emergency left open forever blocks every future emergency for that patient (route_reading
+    # refuses to open a second one while any is still open), so recovery has to be observable from
+    # the vitals themselves and not depend on a hospital account remembering to press Resolve.
+    auto_resolve_normal_readings: int = 3
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
