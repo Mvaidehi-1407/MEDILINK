@@ -59,5 +59,16 @@
             <action android:name="android.intent.action.SENDTO"/>
             <data android:scheme="smsto"/>
         </intent>
+        <!-- Find my hospital: Android 11+ package visibility. Without these, url_launcher cannot
+             see Google Maps / the browser / any geo handler, and the Directions deep link
+             silently fails to launch. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="https"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="geo"/>
+        </intent>
     </queries>
 </manifest>

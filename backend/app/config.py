@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     # refuses to open a second one while any is still open), so recovery has to be observable from
     # the vitals themselves and not depend on a hospital account remembering to press Resolve.
     auto_resolve_normal_readings: int = 3
+    # Once an emergency closes (RESOLVED or CANCELLED), route_reading won't open a new one for
+    # that patient until this many seconds pass. This is a short, always-expiring cooldown -- not
+    # the permanent block the "fires only once" bug had -- that just absorbs a borderline reading
+    # flickering right at the resolve boundary. Disabled (0) by default so an explicit resolve
+    # always frees the patient immediately; deployments that want the flap-guard set this >0.
+    emergency_cooldown_seconds: int = 0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

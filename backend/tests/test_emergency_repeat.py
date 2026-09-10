@@ -157,6 +157,35 @@ async def test_hospital_resolve_frees_the_patient_for_a_new_emergency(mock_db):
 
 
 @pytest.mark.asyncio
+async def test_cooldown_window_briefly_holds_off_a_new_emergency_then_expires(mock_db):
+    """emergency_cooldown_seconds is opt-in (0/disabled by default, see
+    test_hospital_resolve_frees_the_patient_for_a_new_emergency and the three-cycle test below,
+    which both rely on immediate reopening). When a deployment turns it on, it must still be a
+    genuine *window* -- blocking a new emergency right after closure, then getting out of the way
+    on its own once the window has passed -- never a second permanent block."""
+    health, emergency = await _make_service(mock_db, emergency_cooldown_seconds=120)
+    pid = _new_patient_id()
+
+    first = await _route(health, emergency, pid, **HIGH_RISK)
+    await emergency.confirm(first["id"], EmergencyConfirmRequest(patientResponse="NEED_HELP"))
+    await emergency.resolve(first["id"], notes="Handled by command center.")
+
+    # Inside the window: route_reading must not silently reopen a new emergency.
+    assert await _route(health, emergency, pid, **HIGH_RISK) is None
+
+    # Backdate the close past the window (simulates real time elapsing) -- the very next
+    # abnormal reading must open a fresh emergency, proving this is time-bound, not a block.
+    resolved_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=200)
+    await mock_db.emergencies.update_one(
+        {"_id": ObjectId(first["id"])}, {"$set": {"resolvedAt": resolved_at, "updatedAt": resolved_at}},
+    )
+    second = await _route(health, emergency, pid, **HIGH_RISK)
+    assert second is not None
+    assert second["id"] != first["id"]
+    assert second["status"] == "VERIFICATION"
+
+
+@pytest.mark.asyncio
 async def test_three_consecutive_emergencies_produce_three_ids_and_three_calls(mock_db):
     """The audit's named end-to-end validation: three emergencies on ONE account yield three
     distinct emergency IDs and three separate relayed calls to the patient's registered contact."""

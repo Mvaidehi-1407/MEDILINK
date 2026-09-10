@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../core/api_client.dart';
@@ -18,6 +21,7 @@ import '../core/vitals_simulator.dart';
 import '../widgets/common.dart';
 import 'contacts.dart';
 import 'emergency_map.dart';
+import 'find_hospitals.dart';
 import 'medical_vault.dart';
 import 'messaging.dart';
 import 'patients.dart';
@@ -334,10 +338,13 @@ class _PatientHomeState extends ConsumerState<PatientHome> {
                 Icons.folder_copy_outlined,
                 () => _open(context, const MedicalVaultPage()),
               ),
+              // Existing home-screen hospital tile -- unchanged icon, label, colour and position.
+              // Only its destination moved, from the backend-registered HospitalsPage to the
+              // key-less OpenStreetMap "Find my hospital" search (Phase 21).
               ActionTile(
                 'Hospitals',
                 Icons.local_hospital_outlined,
-                () => _open(context, const HospitalsPage()),
+                () => _open(context, const FindHospitalsPage()),
               ),
               ActionTile(
                 'QR',
@@ -507,6 +514,8 @@ class HealthPage extends ConsumerWidget {
         padding: const EdgeInsets.all(16),
         children: [
           HealthStatusCard(patientId: ref.watch(sessionProvider).userId),
+          const SizedBox(height: 16),
+          const BleNoDeviceCard(),
           const SizedBox(height: 16),
           const SectionCard(
             child: SizedBox(
@@ -680,19 +689,604 @@ class _SimulatorPageState extends ConsumerState<SimulatorPage> {
   }
 }
 
-class BlePage extends StatefulWidget {
-  const BlePage({super.key});
-  @override
-  State<BlePage> createState() => _BlePageState();
+/// One decoded vitals frame from a wearable. The BLE link carries newline-delimited JSON over the
+/// Nordic UART service, so a frame that is truncated, malformed, or outside the ranges the backend
+/// accepts (`HealthReadingCreate`) is dropped here rather than being submitted and rejected.
+class BleVitals {
+  const BleVitals({
+    required this.heartRate,
+    required this.spo2,
+    required this.systolicBP,
+    required this.diastolicBP,
+    required this.temperature,
+  });
+
+  final int heartRate;
+  final int spo2;
+  final int systolicBP;
+  final int diastolicBP;
+  final double temperature;
+
+  static BleVitals? tryParse(List<int> frame) {
+    if (frame.isEmpty) return null;
+    Object? decoded;
+    try {
+      decoded = jsonDecode(utf8.decode(frame));
+    } catch (_) {
+      return null;
+    }
+    if (decoded is! Map) return null;
+    final heartRate = _int(decoded['heartRate'] ?? decoded['hr']);
+    final spo2 = _int(decoded['spo2']);
+    final systolic = _int(decoded['systolicBP'] ?? decoded['sys']);
+    final diastolic = _int(decoded['diastolicBP'] ?? decoded['dia']);
+    final temperature = _double(decoded['temperature'] ?? decoded['temp']);
+    if (heartRate == null || spo2 == null || systolic == null || diastolic == null || temperature == null) {
+      return null;
+    }
+    final inRange = heartRate > 0 && heartRate < 260 &&
+        spo2 > 0 && spo2 <= 100 &&
+        systolic > 0 && systolic < 300 &&
+        diastolic > 0 && diastolic < 200 &&
+        temperature > 30 && temperature < 45;
+    if (!inRange) return null;
+    return BleVitals(
+      heartRate: heartRate,
+      spo2: spo2,
+      systolicBP: systolic,
+      diastolicBP: diastolic,
+      temperature: temperature,
+    );
+  }
+
+  static int? _int(Object? value) => value is int ? value : (value is num ? value.round() : null);
+  static double? _double(Object? value) => value is num ? value.toDouble() : null;
+
+  String get summary =>
+      'HR $heartRate | SpO2 $spo2% | BP $systolicBP/$diastolicBP | Temp ${temperature.toStringAsFixed(1)}C';
 }
 
-class _BlePageState extends State<BlePage> {
+/// A BLE peripheral only sometimes tells us who it is: `platformName` is the GAP name the OS has
+/// resolved (often empty until the device has been connected to once), and `advName` is the name
+/// carried in the advertisement. Prefer the resolved name, fall back to the advertised one, and
+/// never invent a placeholder that looks like a real name.
+String bleDeviceName(BluetoothDevice device, {String? advertisedName}) {
+  if (device.platformName.isNotEmpty) return device.platformName;
+  if (device.advName.isNotEmpty) return device.advName;
+  return advertisedName?.trim() ?? '';
+}
+
+/// What the patient sees. An anonymous peripheral is identified by its MAC/remote id so two of them
+/// are still tellable apart -- "Unnamed BLE device" three times over is useless when picking a device.
+String bleDeviceLabel(BluetoothDevice device, {String? advertisedName}) {
+  final name = bleDeviceName(device, advertisedName: advertisedName);
+  return name.isEmpty ? 'Unknown device — ${device.remoteId.str}' : name;
+}
+
+/// The MEDILINK wearable advertises under this prefix. Matching devices are pulled to the top of the
+/// scan list and given a highlighted card, so the one device that matters is not lost among the
+/// earbuds, watches and TVs that any real room full of BLE radios produces.
+const bleTargetNamePrefix = 'MEDILINK';
+
+bool isBleTargetDevice(BluetoothDevice device, {String? advertisedName}) =>
+    bleDeviceName(device, advertisedName: advertisedName).toUpperCase().startsWith(bleTargetNamePrefix);
+
+enum BleStatus { idle, connecting, discovering, streaming, reconnecting, failed }
+
+class BleState {
+  const BleState({
+    this.device,
+    this.deviceName,
+    this.status = BleStatus.idle,
+    this.message,
+    this.lastVitals,
+    this.lastSubmittedAt,
+    this.retryAt,
+  });
+
+  final BluetoothDevice? device;
+  /// Captured when the connection starts: a device dropped mid-session can stop reporting a name,
+  /// and the connected card must not degrade into a bare MAC address while it is still streaming.
+  final String? deviceName;
+  final BleStatus status;
+  final String? message;
+  final BleVitals? lastVitals;
+  final DateTime? lastSubmittedAt;
+  /// When the next retry fires, during a backoff wait. The UI counts down to it so a 32-second
+  /// wait never looks like a frozen screen.
+  final DateTime? retryAt;
+
+  bool get isBusy =>
+      status == BleStatus.connecting || status == BleStatus.discovering || status == BleStatus.reconnecting;
+
+  BleState copyWith({
+    BluetoothDevice? device,
+    String? deviceName,
+    BleStatus? status,
+    String? message,
+    BleVitals? lastVitals,
+    DateTime? lastSubmittedAt,
+    DateTime? retryAt,
+    bool clearMessage = false,
+    bool clearRetryAt = false,
+  }) => BleState(
+    device: device ?? this.device,
+    deviceName: deviceName ?? this.deviceName,
+    status: status ?? this.status,
+    message: clearMessage ? null : message ?? this.message,
+    lastVitals: lastVitals ?? this.lastVitals,
+    lastSubmittedAt: lastSubmittedAt ?? this.lastSubmittedAt,
+    retryAt: clearRetryAt ? null : retryAt ?? this.retryAt,
+  );
+}
+
+/// Owns the live wearable link. It deliberately lives in a provider rather than in `_BlePageState`:
+/// the BLE page is a pushed route the patient closes as soon as the device is paired, and a device
+/// handle or notification subscription held in that widget would be dropped on the next `dispose()`,
+/// silently ending the vitals stream the monitoring pipeline depends on.
+class BleController extends Notifier<BleState> {
+  // The wearable exposes its vitals stream over the Nordic UART service, notifying newline-delimited
+  // JSON frames on the TX characteristic.
+  static final _vitalsServiceUuid = Guid('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+  static final _vitalsCharacteristicUuid = Guid('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+  static const _connectTimeout = Duration(seconds: 10);
+  static const _connectAttempts = 3;
+  static const _reconnectAttempts = 6;
+  static const _initialBackoff = Duration(seconds: 2);
+  static const _maxBackoff = Duration(seconds: 32);
+  // A wearable can notify several times a second; the monitoring pipeline is fed at the same
+  // cadence as the simulator instead of once per notification.
+  static const _minSubmitInterval = Duration(seconds: 5);
+  static const _maxFrameBytes = 4096;
+
+  StreamSubscription<List<int>>? _vitalsSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+  final List<int> _frameBuffer = [];
+  bool _disconnectRequested = false;
+  bool _submitting = false;
+  DateTime? _lastSubmitAt;
+
+  @override
+  BleState build() {
+    ref.onDispose(_cancelSubscriptions);
+    return const BleState();
+  }
+
+  Future<void> connect(BluetoothDevice device, {String? advertisedName}) async {
+    if (state.isBusy) return;
+    _cancelSubscriptions();
+    _disconnectRequested = false;
+    _lastSubmitAt = null;
+    final name = bleDeviceLabel(device, advertisedName: advertisedName);
+    state = BleState(
+      device: device,
+      deviceName: name,
+      status: BleStatus.connecting,
+      message: 'Checking Bluetooth permission...',
+    );
+    if (!await _ensureConnectPermission(name)) return;
+    await _connectWithRetry(device, attempts: _connectAttempts, reconnecting: false);
+  }
+
+  /// Android 12+ (API 31+) gates every GATT operation behind the runtime BLUETOOTH_CONNECT
+  /// permission. The manifest's `<uses-permission>` only declares intent -- it grants nothing by
+  /// itself -- and without an explicit runtime request here, the OS denies the underlying native
+  /// connect with no Dart-catchable exception: `device.connect()` just never completes or streams
+  /// data, which reads to the patient as "I tapped Connect and nothing happened". This must run
+  /// before every connect attempt (a permission can be revoked in Settings between taps), not only
+  /// the first ever call.
+  Future<bool> _ensureConnectPermission(String name) async {
+    if (!Platform.isAndroid) return true;
+    var result = await Permission.bluetoothConnect.status;
+    debugPrint('BLE: BLUETOOTH_CONNECT status before connect = $result');
+    if (!result.isGranted) {
+      result = await Permission.bluetoothConnect.request();
+      debugPrint('BLE: BLUETOOTH_CONNECT status after request = $result');
+    }
+    if (result.isGranted) return true;
+    state = state.copyWith(
+      status: BleStatus.failed,
+      message: result.isPermanentlyDenied
+          ? 'MEDILINK needs Bluetooth permission to connect to $name. Enable it in Settings > Apps > MEDILINK > Permissions, then try again.'
+          : 'MEDILINK needs Bluetooth permission to connect to $name. Grant it when prompted, then try again.',
+    );
+    return false;
+  }
+
+  Future<void> disconnect() async {
+    final device = state.device;
+    _disconnectRequested = true;
+    _cancelSubscriptions();
+    if (device != null) {
+      try {
+        await device.disconnect();
+      } catch (_) {}
+    }
+    state = const BleState();
+  }
+
+  Future<void> _connectWithRetry(
+    BluetoothDevice device, {
+    required int attempts,
+    required bool reconnecting,
+  }) async {
+    final name = state.deviceName ?? bleDeviceLabel(device);
+    var backoff = _initialBackoff;
+    for (var attempt = 1; attempt <= attempts; attempt++) {
+      if (_disconnectRequested) return;
+      state = state.copyWith(
+        status: reconnecting ? BleStatus.reconnecting : BleStatus.connecting,
+        message: '${reconnecting ? 'Reconnecting to' : 'Connecting to'} $name '
+            '(attempt $attempt of $attempts)...',
+        clearRetryAt: true,
+      );
+      try {
+        debugPrint('BLE: connect() attempt $attempt/$attempts -> ${device.remoteId.str} ($name)');
+        await device.connect(license: License.nonprofit, timeout: _connectTimeout);
+        debugPrint('BLE: connect() succeeded -> ${device.remoteId.str} ($name)');
+        await _startVitalsStream(device);
+        return;
+      } catch (error, stackTrace) {
+        // Always log the real error, not just the friendly message shown on screen -- this is
+        // the only place a developer can see *why* a connect actually failed on a real device.
+        debugPrint('BLE: connect() failed -> ${device.remoteId.str} ($name): $error');
+        debugPrintStack(stackTrace: stackTrace, label: 'BLE connect error');
+        // A failed connect can still leave a half-open link that blocks the next attempt.
+        try {
+          await device.disconnect();
+        } catch (_) {}
+        if (attempt == attempts || _disconnectRequested) {
+          state = state.copyWith(
+            status: BleStatus.failed,
+            message: _friendlyError(error, name),
+            clearRetryAt: true,
+          );
+          return;
+        }
+        // Publishing the retry deadline lets the screen count down through the backoff instead of
+        // sitting on a motionless "connecting" for up to 32 seconds.
+        state = state.copyWith(retryAt: DateTime.now().add(backoff));
+        await Future<void>.delayed(backoff);
+        backoff = backoff * 2 > _maxBackoff ? _maxBackoff : backoff * 2;
+      }
+    }
+  }
+
+  /// BLE plugin exceptions stringify into things like `FlutterBluePlusException | connect | ...`,
+  /// which tells a patient nothing. Map the cases they can actually act on.
+  static String _friendlyError(Object error, String name) {
+    final text = error.toString().toLowerCase();
+    if (error is TimeoutException || text.contains('timed out') || text.contains('timeout')) {
+      return '$name did not respond in time. Move it closer to your phone and try again.';
+    }
+    if (text.contains('bluetooth must be turned on') || text.contains('adapter is off') || text.contains('poweredoff')) {
+      return 'Bluetooth is off. Turn Bluetooth on, then connect again.';
+    }
+    if (text.contains('permission') || text.contains('unauthorized')) {
+      return 'MEDILINK needs Bluetooth permission to reach $name. Grant it in Settings, then try again.';
+    }
+    if (text.contains('android-code: 133') || text.contains('connection failed')) {
+      return 'Could not reach $name. Make sure it is switched on and not paired with another phone.';
+    }
+    return 'Could not connect to $name. Check that it is switched on and nearby, then try again.';
+  }
+
+  Future<void> _startVitalsStream(BluetoothDevice device) async {
+    final name = state.deviceName ?? bleDeviceLabel(device);
+    state = state.copyWith(
+      status: BleStatus.discovering,
+      message: 'Connected to $name. Reading its services...',
+      clearRetryAt: true,
+    );
+    final services = await device.discoverServices();
+    BluetoothCharacteristic? vitals;
+    for (final service in services) {
+      if (service.serviceUuid != _vitalsServiceUuid) continue;
+      for (final characteristic in service.characteristics) {
+        if (characteristic.characteristicUuid == _vitalsCharacteristicUuid &&
+            (characteristic.properties.notify || characteristic.properties.indicate)) {
+          vitals = characteristic;
+        }
+      }
+    }
+    if (vitals == null) {
+      _disconnectRequested = true;
+      try {
+        await device.disconnect();
+      } catch (_) {}
+      state = state.copyWith(
+        status: BleStatus.failed,
+        message: '$name is not a MEDILINK vitals device — it does not publish readings this app can use.',
+      );
+      return;
+    }
+    _frameBuffer.clear();
+    await vitals.setNotifyValue(true);
+    _vitalsSubscription = vitals.onValueReceived.listen(_onNotification);
+    _connectionSubscription = device.connectionState.listen((connectionState) {
+      if (connectionState == BluetoothConnectionState.disconnected) _handleDisconnect(device);
+    });
+    state = state.copyWith(
+      status: BleStatus.streaming,
+      message: 'Receiving vitals from $name.',
+      clearRetryAt: true,
+    );
+  }
+
+  void _handleDisconnect(BluetoothDevice device) {
+    if (_disconnectRequested || state.status == BleStatus.reconnecting) return;
+    _cancelSubscriptions();
+    _connectWithRetry(device, attempts: _reconnectAttempts, reconnecting: true);
+  }
+
+  void _onNotification(List<int> packet) {
+    _frameBuffer.addAll(packet);
+    var newline = _frameBuffer.indexOf(0x0a);
+    while (newline != -1) {
+      final frame = _frameBuffer.sublist(0, newline);
+      _frameBuffer.removeRange(0, newline + 1);
+      final vitals = BleVitals.tryParse(frame);
+      if (vitals != null) _submit(vitals);
+      newline = _frameBuffer.indexOf(0x0a);
+    }
+    // A device that never sends the delimiter must not grow this buffer without bound.
+    if (_frameBuffer.length > _maxFrameBytes) _frameBuffer.clear();
+  }
+
+  /// Readings go through the same `/health/readings` submission the simulator uses -- identical
+  /// body shape, labelled `source: BLE` instead of `DEMO`.
+  Future<void> _submit(BleVitals vitals) async {
+    final now = DateTime.now();
+    if (_submitting) return;
+    if (_lastSubmitAt != null && now.difference(_lastSubmitAt!) < _minSubmitInterval) {
+      state = state.copyWith(lastVitals: vitals);
+      return;
+    }
+    final patientId = ref.read(sessionProvider).userId;
+    if (patientId.isEmpty) return;
+    _submitting = true;
+    _lastSubmitAt = now;
+    try {
+      await ref.read(apiClientProvider).submitReading({
+        'patientId': patientId,
+        'heartRate': vitals.heartRate,
+        'spo2': vitals.spo2,
+        'systolicBP': vitals.systolicBP,
+        'diastolicBP': vitals.diastolicBP,
+        'temperature': vitals.temperature,
+        'deviceId': state.device?.remoteId.str ?? 'ble-device',
+        'source': 'BLE',
+      });
+      state = state.copyWith(lastVitals: vitals, lastSubmittedAt: now, clearMessage: true);
+      ref.invalidate(currentReadingProvider(patientId));
+    } on ApiException catch (error) {
+      state = state.copyWith(lastVitals: vitals, message: 'Reading not accepted: ${error.message}');
+    } finally {
+      _submitting = false;
+    }
+  }
+
+  void _cancelSubscriptions() {
+    _vitalsSubscription?.cancel();
+    _vitalsSubscription = null;
+    _connectionSubscription?.cancel();
+    _connectionSubscription = null;
+  }
+}
+
+final bleProvider = NotifierProvider<BleController, BleState>(BleController.new);
+
+/// How each connection state is presented. Deliberately reuses the app's existing colour language
+/// rather than introducing a second one: teal is "monitoring is live" (as on the supervision-mode
+/// badge), blue is neutral/in-progress, and amber is "needs your attention". Red is reserved
+/// throughout MEDILINK for genuine danger -- a wearable that failed to pair is a setup problem, not
+/// a medical emergency, and colouring it like one would blunt the emergency screens' own signal.
+/// Every state carries an icon and a word, so the state never depends on colour alone.
+({String label, IconData icon, Color color, bool inProgress}) bleStatusPresentation(BleStatus status) =>
+    switch (status) {
+      BleStatus.idle => (
+          label: 'Not connected',
+          icon: Icons.bluetooth_outlined,
+          color: MedilinkColors.blue,
+          inProgress: false,
+        ),
+      BleStatus.connecting => (
+          label: 'Connecting',
+          icon: Icons.bluetooth_searching,
+          color: MedilinkColors.blue,
+          inProgress: true,
+        ),
+      BleStatus.discovering => (
+          label: 'Setting up',
+          icon: Icons.settings_bluetooth,
+          color: MedilinkColors.blue,
+          inProgress: true,
+        ),
+      BleStatus.streaming => (
+          label: 'Connected',
+          icon: Icons.bluetooth_connected,
+          color: MedilinkColors.teal,
+          inProgress: false,
+        ),
+      BleStatus.reconnecting => (
+          label: 'Reconnecting',
+          icon: Icons.sync,
+          color: MedilinkColors.amber,
+          inProgress: true,
+        ),
+      BleStatus.failed => (
+          label: 'Not connected',
+          icon: Icons.error_outline,
+          color: MedilinkColors.amber,
+          inProgress: false,
+        ),
+    };
+
+/// Icon + word + colour, matching `StatusBadge`/`EscalationStageBadge`. The label is never dropped,
+/// so the state survives a colourblind reader and a screen reader alike.
+class BleStatusBadge extends StatelessWidget {
+  const BleStatusBadge({super.key, required this.status});
+  final BleStatus status;
+
+  @override
+  Widget build(BuildContext context) {
+    final presentation = bleStatusPresentation(status);
+    return Semantics(
+      label: 'Device status ${presentation.label}',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: presentation.color.withValues(alpha: .12),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: presentation.color.withValues(alpha: .4)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (presentation.inProgress)
+              SizedBox.square(
+                dimension: 12,
+                child: CircularProgressIndicator(strokeWidth: 2, color: presentation.color),
+              )
+            else
+              Icon(presentation.icon, size: 14, color: presentation.color),
+            const SizedBox(width: 6),
+            Text(
+              presentation.label,
+              style: TextStyle(color: presentation.color, fontWeight: FontWeight.w700, fontSize: 11),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A slow opacity pulse, used only where the app is genuinely waiting on something outside its
+/// control. It honours the platform "reduce motion" setting, and it is calm on purpose: waiting for
+/// a wearable during setup is normal, so this must not read like an alarm.
+class BleWaitingPulse extends StatefulWidget {
+  const BleWaitingPulse({super.key, required this.child});
+  final Widget child;
+  @override
+  State<BleWaitingPulse> createState() => _BleWaitingPulseState();
+}
+
+class _BleWaitingPulseState extends State<BleWaitingPulse> with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1400),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (MediaQuery.of(context).disableAnimations) return widget.child;
+    return FadeTransition(
+      opacity: Tween<double>(begin: .45, end: 1).animate(
+        CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+      ),
+      child: widget.child,
+    );
+  }
+}
+
+/// The vitals screen's answer to "why is nothing here?". Shown on the Health page whenever no
+/// wearable is streaming, it states the situation plainly and offers the one action that fixes it,
+/// without borrowing the emergency screens' red.
+class BleNoDeviceCard extends ConsumerWidget {
+  const BleNoDeviceCard({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final ble = ref.watch(bleProvider);
+    final presentation = bleStatusPresentation(ble.status);
+    final connected = ble.status == BleStatus.streaming;
+    final waiting = connected && ble.lastVitals == null;
+    final (title, detail) = connected
+        ? waiting
+              ? ('Waiting for device data...', 'Connected to ${ble.deviceName ?? 'your wearable'}. Readings appear here as they arrive.')
+              : ('${ble.deviceName ?? 'Your wearable'} is sending readings', ble.lastVitals!.summary)
+        : ble.isBusy
+        ? (presentation.label, ble.message ?? 'Setting up your wearable...')
+        : (
+            'No device connected',
+            ble.message ?? 'Connect a wearable to stream live vitals. Your health history stays available either way.',
+          );
+    final icon = Icon(presentation.icon, color: presentation.color, size: 28);
+    return SectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              waiting || ble.isBusy ? BleWaitingPulse(child: icon) : icon,
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
+              ),
+              BleStatusBadge(status: ble.status),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(detail, style: Theme.of(context).textTheme.bodySmall),
+          if (ble.isBusy) ...[
+            const SizedBox(height: 10),
+            const LinearProgressIndicator(minHeight: 3),
+          ],
+          if (!connected) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                style: TextButton.styleFrom(minimumSize: const Size(88, 48)),
+                onPressed: () => _open(context, const BlePage()),
+                icon: const Icon(Icons.bluetooth_searching),
+                label: const Text('Connect a device'),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class BlePage extends ConsumerStatefulWidget {
+  const BlePage({super.key});
+  @override
+  ConsumerState<BlePage> createState() => _BlePageState();
+}
+
+class _BlePageState extends ConsumerState<BlePage> {
+  static const _scanDuration = Duration(seconds: 8);
+  // Every tappable row and button on this screen clears the 44pt minimum touch target: the patient
+  // may be using it one-handed, in a hurry, or with shaky hands.
+  static const _minTouchTarget = 48.0;
+
   StreamSubscription<List<ScanResult>>? sub;
   List<ScanResult> devices = [];
   bool scanning = false;
+  // Drives the retry countdown so a backoff wait always shows something moving.
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted && ref.read(bleProvider).retryAt != null) setState(() {});
+    });
+  }
+
   @override
   void dispose() {
     sub?.cancel();
+    _ticker?.cancel();
     super.dispose();
   }
 
@@ -704,58 +1298,255 @@ class _BlePageState extends State<BlePage> {
     sub = FlutterBluePlus.scanResults.listen((v) {
       if (mounted) setState(() => devices = v);
     });
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
-    await Future<void>.delayed(const Duration(seconds: 8));
+    await FlutterBluePlus.startScan(timeout: _scanDuration);
+    await Future<void>.delayed(_scanDuration);
     if (mounted) setState(() => scanning = false);
   }
 
+  /// The MEDILINK wearable first, then everything that at least told us its name, then the
+  /// anonymous radios -- strongest signal first within each group.
+  List<ScanResult> _sorted() {
+    final sorted = [...devices];
+    sorted.sort((a, b) {
+      final aTarget = isBleTargetDevice(a.device, advertisedName: a.advertisementData.advName);
+      final bTarget = isBleTargetDevice(b.device, advertisedName: b.advertisementData.advName);
+      if (aTarget != bTarget) return aTarget ? -1 : 1;
+      final aNamed = bleDeviceName(a.device, advertisedName: a.advertisementData.advName).isNotEmpty;
+      final bNamed = bleDeviceName(b.device, advertisedName: b.advertisementData.advName).isNotEmpty;
+      if (aNamed != bNamed) return aNamed ? -1 : 1;
+      return b.rssi.compareTo(a.rssi);
+    });
+    return sorted;
+  }
+
+  /// The status of one scan row: the live connection state for the device we are talking to,
+  /// `null` for every other row (which is simply available to connect to).
+  BleStatus? _statusFor(ScanResult result, BleState ble) =>
+      ble.device?.remoteId == result.device.remoteId ? ble.status : null;
+
   @override
-  Widget build(BuildContext context) => PageFrame(
-    title: 'Connected devices',
-    child: ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        SectionCard(
-          child: ListTile(
-            leading: Icon(
-              scanning ? Icons.radar : Icons.bluetooth_outlined,
-              color: MedilinkColors.blue,
+  Widget build(BuildContext context) {
+    final ble = ref.watch(bleProvider);
+    final results = _sorted();
+    return PageFrame(
+      title: 'Connected devices',
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _summaryCard(ble),
+          const SizedBox(height: 16),
+          if (results.isEmpty)
+            scanning
+                ? const SectionCard(
+                    child: SizedBox(
+                      height: 120,
+                      child: LoadingState(label: 'Looking for nearby devices...'),
+                    ),
+                  )
+                : const EmptyState(
+                    title: 'No nearby devices',
+                    detail: 'Turn on Bluetooth, make sure your wearable is switched on, then scan again.',
+                    icon: Icons.bluetooth_disabled,
+                  ),
+          ...results.map((result) => _deviceCard(result, ble)),
+        ],
+      ),
+    );
+  }
+
+  Widget _summaryCard(BleState ble) {
+    final presentation = bleStatusPresentation(ble.status);
+    final retryIn = ble.retryAt?.difference(DateTime.now()).inSeconds;
+    final icon = Icon(presentation.icon, color: presentation.color, size: 28);
+    return SectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              ble.isBusy ? BleWaitingPulse(child: icon) : icon,
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  ble.deviceName ?? (scanning ? 'Searching for devices' : 'No device connected'),
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+              ),
+              BleStatusBadge(status: ble.status),
+            ],
+          ),
+          if (ble.message != null) ...[
+            const SizedBox(height: 8),
+            Text(ble.message!, style: Theme.of(context).textTheme.bodySmall),
+          ],
+          // Never leave a connection attempt sitting still: something on screen is always moving
+          // while the app is waiting, and a backoff wait shows the seconds ticking down.
+          if (ble.isBusy) ...[
+            const SizedBox(height: 10),
+            if (retryIn != null && retryIn > 0)
+              Text(
+                'Next attempt in ${retryIn}s...',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: MedilinkColors.amber),
+              ),
+            const SizedBox(height: 6),
+            const LinearProgressIndicator(minHeight: 3),
+          ],
+          if (ble.lastVitals != null) ...[
+            const SizedBox(height: 10),
+            Text(ble.lastVitals!.summary, style: const TextStyle(fontWeight: FontWeight.w700)),
+            Text(
+              ble.lastSubmittedAt == null
+                  ? 'Not submitted yet'
+                  : 'Last submitted ${_clock(ble.lastSubmittedAt!)}',
+              style: Theme.of(context).textTheme.bodySmall,
             ),
-            title: Text(
-              scanning ? 'Searching for BLE devices' : 'No device connected',
-            ),
-            trailing: TextButton(
-              onPressed: scanning ? null : scan,
-              child: const Text('Scan'),
-            ),
+          ],
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(minimumSize: const Size(88, _minTouchTarget)),
+                  onPressed: scanning ? null : scan,
+                  icon: scanning
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.radar),
+                  label: Text(scanning ? 'Scanning...' : 'Scan'),
+                ),
+              ),
+              if (ble.device != null) ...[
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size(88, _minTouchTarget),
+                      foregroundColor: MedilinkColors.blue,
+                    ),
+                    onPressed: () => ref.read(bleProvider.notifier).disconnect(),
+                    icon: const Icon(Icons.bluetooth_disabled),
+                    label: const Text('Disconnect'),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _deviceCard(ScanResult result, BleState ble) {
+    final advertisedName = result.advertisementData.advName;
+    final label = bleDeviceLabel(result.device, advertisedName: advertisedName);
+    final named = bleDeviceName(result.device, advertisedName: advertisedName).isNotEmpty;
+    final isTarget = isBleTargetDevice(result.device, advertisedName: advertisedName);
+    final status = _statusFor(result, ble);
+    final isConnected = status == BleStatus.streaming;
+    final isBusyHere = status != null && ble.isBusy;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Container(
+        // The device the patient is actually looking for gets a highlighted card; the surrounding
+        // BLE noise (earbuds, watches, TVs) stays visually quiet so it cannot be mistaken for it.
+        decoration: isTarget
+            ? BoxDecoration(
+                color: MedilinkColors.teal.withValues(alpha: .06),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: MedilinkColors.teal, width: 2),
+              )
+            : null,
+        child: SectionCard(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    isTarget ? Icons.monitor_heart_outlined : Icons.bluetooth,
+                    color: isTarget ? MedilinkColors.teal : Colors.blueGrey,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          label,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontWeight: isTarget || named ? FontWeight.w800 : FontWeight.w500,
+                            color: named ? null : Colors.blueGrey,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          isTarget
+                              ? 'MEDILINK wearable · signal ${result.rssi} dBm'
+                              : 'Signal ${result.rssi} dBm',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  if (status != null) BleStatusBadge(status: status),
+                ],
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                height: _minTouchTarget,
+                child: isConnected
+                    // Once connected the row stops offering "Connect" and offers the only useful
+                    // action left, so the screen never shows a button that does nothing.
+                    ? OutlinedButton.icon(
+                        onPressed: () => ref.read(bleProvider.notifier).disconnect(),
+                        icon: const Icon(Icons.bluetooth_disabled),
+                        label: Text('Disconnect ${ble.deviceName ?? label}', overflow: TextOverflow.ellipsis),
+                      )
+                    : FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: isTarget ? MedilinkColors.teal : null,
+                        ),
+                        onPressed: ble.isBusy ? null : () => ref.read(bleProvider.notifier).connect(result.device, advertisedName: advertisedName),
+                        icon: isBusyHere
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                              )
+                            : const Icon(Icons.link),
+                        label: Text(isBusyHere ? bleStatusPresentation(ble.status).label : 'Connect'),
+                      ),
+              ),
+              if (status == BleStatus.failed && ble.message != null) ...[
+                const SizedBox(height: 6),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.info_outline, size: 16, color: MedilinkColors.amber),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        ble.message!,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: MedilinkColors.amber),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
           ),
         ),
-        const SizedBox(height: 16),
-        if (devices.isEmpty && !scanning)
-          const EmptyState(
-            title: 'No nearby devices',
-            detail: 'Turn on Bluetooth and scan for a compatible wearable.',
-            icon: Icons.bluetooth_disabled,
-          ),
-        ...devices.map(
-          (d) => SectionCard(
-            child: ListTile(
-              title: Text(
-                d.device.platformName.isEmpty
-                    ? 'Unnamed BLE device'
-                    : d.device.platformName,
-              ),
-              subtitle: Text('Signal ${d.rssi} dBm'),
-              trailing: TextButton(
-                onPressed: () => d.device.connect(license: License.nonprofit),
-                child: const Text('Connect'),
-              ),
-            ),
-          ),
-        ),
-      ],
-    ),
-  );
+      ),
+    );
+  }
+
+  static String _clock(DateTime time) =>
+      '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}:${time.second.toString().padLeft(2, '0')}';
 }
 
 class EmergencyPage extends ConsumerStatefulWidget {
@@ -779,6 +1570,15 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
   double sosHoldProgress = 0;
   bool sosSending = false;
   bool resolved = false;
+  // Auto-resolve/cooldown state (mirrors the fields emergency_service.py stamps on the doc) --
+  // drives the "N more normal readings" / "cooldown ends in..." indicators below.
+  int? _consecutiveNormalReadings;
+  int? _autoResolveThreshold;
+  DateTime? _resolvedAt;
+  int? _cooldownSeconds;
+  Timer? _cooldownTicker;
+  RealtimeConnection? _connection;
+  StreamSubscription? _realtimeSubscription;
   static const _sosHoldDuration = Duration(milliseconds: 1800);
   // A manual SOS started from this same screen stays on this same widget instance instead of
   // navigating to a new route -- this page can be a bottom-nav tab (not just a pushed route), so
@@ -797,10 +1597,76 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       // repeating haptic pulse, since a missed alert here is the worst possible outcome.
       hapticTimer = Timer.periodic(const Duration(milliseconds: 900), (_) => HapticFeedback.heavyImpact());
       HapticFeedback.heavyImpact();
+      _subscribeRealtime();
     }
     ref.read(apiClientProvider).systemStatus().then((status) {
       if (mounted) setState(() => callProviderMode = status['callProviderMode']?.toString());
     }).catchError((_) {});
+  }
+
+  /// Keeps the auto-resolve/cooldown indicators live once the countdown screen is left behind --
+  /// without this, an emergency that later auto-resolves server-side (vitals normalizing while
+  /// CONFIRMED/ACKNOWLEDGED/RESPONDING) would leave this screen frozen on a stale status forever,
+  /// since nothing else here re-fetches after the initial load.
+  void _subscribeRealtime() {
+    final patientId = ref.read(sessionProvider).userId;
+    _realtimeSubscription?.cancel();
+    _connection?.dispose();
+    _connection = RealtimeService(ref.read(sessionProvider.notifier), ref.read(apiClientProvider)).patientChannel(patientId);
+    _realtimeSubscription = _connection!.events.listen((event) {
+      if (event['event'] != 'emergency.updated') return;
+      final data = event['data'];
+      if (data is Map && data['id']?.toString() == _activeId) {
+        _applyEmergencyData(Map<String, dynamic>.from(data));
+      }
+    });
+  }
+
+  void _applyEmergencyData(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final status = data['status']?.toString();
+    setState(() {
+      _consecutiveNormalReadings = (data['consecutiveNormalReadings'] as num?)?.toInt();
+      _autoResolveThreshold = (data['autoResolveThreshold'] as num?)?.toInt();
+      _cooldownSeconds = (data['cooldownSeconds'] as num?)?.toInt();
+      final resolvedAtRaw = data['resolvedAt']?.toString();
+      _resolvedAt = (resolvedAtRaw != null && resolvedAtRaw.isNotEmpty) ? DateTime.tryParse(resolvedAtRaw) : null;
+      if (status != null) {
+        emergencyStatus = status;
+        resolved = status != 'VERIFICATION';
+      }
+    });
+    if (resolved) {
+      timer?.cancel();
+      hapticTimer?.cancel();
+      _startCooldownTicker();
+    }
+  }
+
+  /// Ticks once a second so the "cooldown ends in Xs" text on the resolved screen counts down
+  /// live instead of only updating on the next realtime push.
+  void _startCooldownTicker() {
+    _cooldownTicker?.cancel();
+    if (_resolvedAt == null || (_cooldownSeconds ?? 0) <= 0) return;
+    _cooldownTicker = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted || _cooldownRemainingSeconds <= 0) {
+        t.cancel();
+        return;
+      }
+      setState(() {});
+    });
+  }
+
+  int get _cooldownRemainingSeconds {
+    if (_resolvedAt == null || _cooldownSeconds == null) return 0;
+    final elapsed = DateTime.now().toUtc().difference(_resolvedAt!.toUtc()).inSeconds;
+    return (_cooldownSeconds! - elapsed).clamp(0, _cooldownSeconds!);
+  }
+
+  static String _formatClock(DateTime time) {
+    final local = time.toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(local.hour)}:${two(local.minute)}:${two(local.second)}';
   }
 
   Future<void> _loadCountdownAndStart() async {
@@ -812,11 +1678,9 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       panicAttackType = emergency['panicAttackType']?.toString();
       // If this screen is opened on an emergency that already moved past VERIFICATION (e.g. a
       // stale deep link, or reopening after the fact), don't start a countdown that would try
-      // an invalid transition -- just show the resolved state.
-      if (emergency['status'] != 'VERIFICATION') {
-        resolved = true;
-        emergencyStatus = emergency['status']?.toString();
-      }
+      // an invalid transition -- just show the resolved/current state, with its auto-resolve and
+      // cooldown fields, exactly as a realtime push would.
+      _applyEmergencyData(Map<String, dynamic>.from(emergency));
       final timeline = (emergency['timeline'] as List?) ?? const [];
       final verificationEvent = timeline.lastWhere(
         (e) => e is Map && e['event'] == 'VERIFICATION',
@@ -849,6 +1713,9 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
     timer?.cancel();
     hapticTimer?.cancel();
     sosHoldTimer?.cancel();
+    _cooldownTicker?.cancel();
+    _realtimeSubscription?.cancel();
+    _connection?.dispose();
     super.dispose();
   }
 
@@ -883,6 +1750,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       Navigator.of(context).maybePop();
       return;
     }
+    _cooldownTicker?.cancel();
     // Manual SOS on the Emergency tab itself -- this widget IS the tab, not a pushed route, so
     // "back to home" means resetting back to the pre-SOS screen in place.
     setState(() {
@@ -892,6 +1760,10 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       emergencyStatus = null;
       seconds = 30;
       sosHoldProgress = 0;
+      _consecutiveNormalReadings = null;
+      _autoResolveThreshold = null;
+      _resolvedAt = null;
+      _cooldownSeconds = null;
     });
   }
 
@@ -912,13 +1784,21 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
           message = null;
           emergencyStatus = null;
           loadingCountdown = true;
+          _consecutiveNormalReadings = null;
+          _autoResolveThreshold = null;
+          _resolvedAt = null;
+          _cooldownSeconds = null;
         });
         hapticTimer?.cancel();
         hapticTimer = Timer.periodic(const Duration(milliseconds: 900), (_) => HapticFeedback.heavyImpact());
+        _subscribeRealtime();
         await _loadCountdownAndStart();
       }
     } on ApiException catch (e) {
-      if (mounted) setState(() => message = 'SOS failed: ${e.message}');
+      // 409 means the backend's dedup guard already found an open emergency (manual OR
+      // AI-detected) for this patient -- show that exact reason rather than a generic "SOS
+      // failed", so the tap never reads as having silently done nothing.
+      if (mounted) setState(() => message = e.statusCode == 409 ? e.message : 'SOS failed: ${e.message}');
     } finally {
       if (mounted) setState(() => sosSending = false);
     }
@@ -954,20 +1834,12 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       }
       final response = await ref.read(apiClientProvider).emergencyAction(_activeId!, action, body);
       if (!mounted) return;
-      final status = response['status']?.toString();
-      if (action == 'cancel' && status == 'CANCELLED') {
-        // "I'm OK" means there's no active emergency to show anymore -- go straight back
-        // rather than making the patient dismiss a second "you're safe" screen themselves.
-        _backToHome();
-        return;
-      }
       // VERIFICATION is the only status the confirm/cancel buttons apply to -- once it moves on
       // (CONFIRMED/CANCELLED/etc), stop offering actions that the backend will now correctly
-      // reject as an invalid transition.
-      setState(() {
-        emergencyStatus = status;
-        resolved = status != 'VERIFICATION';
-      });
+      // reject as an invalid transition. Show the outcome ("You're marked safe at HH:MM:SS")
+      // rather than silently reverting to the idle screen -- a resolved/cancelled event still
+      // needs to be visibly confirmed, not just dismissed.
+      _applyEmergencyData(Map<String, dynamic>.from(response));
     } on ApiException catch (error) {
       if (mounted) setState(() => message = error.message);
     } finally {
@@ -1140,6 +2012,32 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
               Icon(isSafe ? Icons.check_circle : Icons.info_outline, color: isSafe ? MedilinkColors.teal : MedilinkColors.amber, size: 40),
               const SizedBox(height: 8),
               Text(body, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700)),
+              // A closed event must say so plainly -- "Emergency resolved at 14:32:05" -- rather
+              // than the screen just quietly reverting, which reads as if nothing happened.
+              if (isSafe) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '${emergencyStatus == 'CANCELLED' ? 'Marked safe' : 'Emergency resolved'} at ${_formatClock(_resolvedAt ?? DateTime.now())}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontWeight: FontWeight.w800, color: MedilinkColors.teal),
+                ),
+              ],
+              if (isSafe && _cooldownRemainingSeconds > 0) ...[
+                const SizedBox(height: 6),
+                Text(
+                  'A new alert can trigger again in ${_cooldownRemainingSeconds}s.',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+              if (!isSafe && emergencyStatus != 'HOSPITAL_ESCALATED' && _autoResolveThreshold != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '${((_autoResolveThreshold! - (_consecutiveNormalReadings ?? 0)).clamp(0, _autoResolveThreshold!))} more normal reading(s) needed to auto-resolve.',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
               if (message != null && message != body) ...[
                 const SizedBox(height: 8),
                 Text(message!, textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodySmall),
@@ -1229,8 +2127,17 @@ class _EmergencyListState extends ConsumerState<EmergencyList> {
     );
     if (confirmed != true) return;
     try {
-      await ref.read(apiClientProvider).resolveEmergency(emergencyId, notes: 'Resolved from hospital command center.');
+      final updated = await ref.read(apiClientProvider).resolveEmergency(emergencyId, notes: 'Resolved from hospital command center.');
       _load();
+      if (mounted) {
+        final resolvedAtRaw = updated['resolvedAt']?.toString();
+        final resolvedAt = (resolvedAtRaw != null && resolvedAtRaw.isNotEmpty) ? DateTime.tryParse(resolvedAtRaw) : null;
+        // A clear confirmation state, not a silent list refresh -- staff need to see the action
+        // actually landed, and when, since it's what frees this patient for a future alert.
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Emergency resolved at ${_EmergencyPageState._formatClock(resolvedAt ?? DateTime.now())}'),
+        ));
+      }
     } on ApiException catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
     }

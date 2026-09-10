@@ -51,11 +51,20 @@ class EmergencyService:
     # ---- Manual/legacy SOS creation (Part 1/2, still used directly) --------------------------
 
     async def create(self, payload: EmergencyCreate) -> dict:
+        # Same open-emergency guard route_reading() uses (query is source-agnostic, so a manual
+        # SOS is blocked by an already-open AI-detected emergency and vice versa) -- without it,
+        # tapping SOS while any emergency for this patient is already in flight opened a second,
+        # parallel one instead of surfacing the one already active.
+        existing = await self.emergencies.find_one({"patientId": payload.patientId, "status": {"$in": _OPEN_STATUSES}})
+        if existing:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Emergency already active")
+
         now = utcnow()
         risk = payload.risk.model_dump(mode="json") if payload.risk else None
         emergency = await self.emergencies.insert({
             "patientId": payload.patientId,
             "trigger": payload.trigger,
+            "source": "manual",
             "reading": payload.reading.model_dump(mode="json") if payload.reading else None,
             "risk": risk,
             "status": EmergencyStatus.VERIFICATION.value,
@@ -103,6 +112,11 @@ class EmergencyService:
             return await self._track_recovery(existing, is_abnormal)
         if not is_abnormal:
             return None
+        if await self._in_cooldown(reading["patientId"]):
+            # Recently resolved/cancelled -- briefly hold off opening a new one so a single
+            # borderline reading right at the resolve boundary doesn't immediately reopen the
+            # page. This expires on its own (see _in_cooldown); it never blocks permanently.
+            return None
 
         now = utcnow()
         if panic.route_to_supervision:
@@ -132,6 +146,7 @@ class EmergencyService:
         return {
             "patientId": reading["patientId"],
             "trigger": "PANIC_PATTERN" if panic.panic_pattern_detected else "HIGH_RISK",
+            "source": "ai_detected",
             "reading": reading,
             "risk": reading.get("risk"),
             "status": status.value,
@@ -151,10 +166,31 @@ class EmergencyService:
             "contactNotifiedAt": None,
             # Recovery streak driving auto-resolve; reset by any abnormal reading.
             "consecutiveNormalReadings": 0,
+            # Copied from settings at creation time so clients can render an accurate "N more
+            # normal readings until auto-resolve" indicator without needing their own config.
+            "autoResolveThreshold": self.settings.auto_resolve_normal_readings,
             "autoResolved": False,
+            "resolvedAt": None,
+            "cooldownSeconds": self.settings.emergency_cooldown_seconds,
             "createdAt": now,
             "updatedAt": now,
         }
+
+    async def _in_cooldown(self, patient_id: str) -> bool:
+        """True while `patient_id`'s most recently closed emergency is still inside its cooldown
+        window. Time-bound and self-expiring -- once emergency_cooldown_seconds elapses this
+        always returns False again, unlike the permanent block this bug fix replaces."""
+        cooldown = timedelta(seconds=self.settings.emergency_cooldown_seconds)
+        if cooldown <= timedelta(0):
+            return False
+        recent = await self.emergencies.list(
+            {"patientId": patient_id, "status": {"$in": [EmergencyStatus.RESOLVED.value, EmergencyStatus.CANCELLED.value]}},
+            limit=1, sort=[("updatedAt", -1)],
+        )
+        if not recent:
+            return False
+        closed_at = recent[0].get("resolvedAt") or recent[0].get("updatedAt")
+        return elapsed_since(closed_at) < cooldown
 
     async def _track_recovery(self, emergency: dict, is_abnormal: bool) -> dict | None:
         """Counts consecutive NORMAL readings against a still-open emergency and closes it once
@@ -501,7 +537,14 @@ class EmergencyService:
         now = utcnow()
         timeline = emergency.get("timeline", [])
         timeline.append({"event": target.value, "timestamp": now, "details": details or {}})
-        update = {"$set": {"status": target.value, "timeline": timeline, "updatedAt": now, **(update_fields or {})}}
+        fields = {"status": target.value, "timeline": timeline, "updatedAt": now, **(update_fields or {})}
+        if target in (EmergencyStatus.RESOLVED, EmergencyStatus.CANCELLED):
+            # Drives both _in_cooldown() and the "resolved at [time]" / cooldown-remaining
+            # indicators the client renders -- stamped here so every path to RESOLVED/CANCELLED
+            # (hospital resolve, patient cancel, auto-resolve, supervision normalize) gets it.
+            fields.setdefault("resolvedAt", now)
+            fields.setdefault("cooldownSeconds", self.settings.emergency_cooldown_seconds)
+        update = {"$set": fields}
         updated = await self.emergencies.update(emergency["id"], update)
         await self._broadcast(updated)
         return updated
