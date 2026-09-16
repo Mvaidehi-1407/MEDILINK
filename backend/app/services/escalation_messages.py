@@ -10,6 +10,14 @@ def _vitals_snapshot(reading: Optional[Dict[str, Any]]) -> str:
     return f"HR {reading.get('heartRate', '--')}, SpO2 {reading.get('spo2', '--')}%"
 
 
+def _hospital_line(nearest_hospital: Optional[Dict[str, Any]]) -> str:
+    if not nearest_hospital:
+        return "not available"
+    name = nearest_hospital.get("name") or "Unnamed hospital"
+    address = nearest_hospital.get("address") or "address unavailable"
+    return f"{name} -- {address}"
+
+
 def _location_line(emergency: Dict[str, Any]) -> str:
     location = emergency.get("location")
     address = emergency.get("address")
@@ -22,7 +30,7 @@ def _location_line(emergency: Dict[str, Any]) -> str:
     return f"{latitude}, {longitude}" + (f" -- {address}" if address else "")
 
 
-def contact_alert_message(patient: Dict[str, Any], emergency: Dict[str, Any]) -> str:
+def contact_alert_message(patient: Dict[str, Any], emergency: Dict[str, Any], nearest_hospital: Optional[Dict[str, Any]] = None) -> str:
     age = patient.get("age")
     panic_type = emergency.get("panicAttackType", "UNKNOWN")
     reading = emergency.get("reading")
@@ -32,13 +40,14 @@ def contact_alert_message(patient: Dict[str, Any], emergency: Dict[str, Any]) ->
         "is experiencing abnormal vitals suggestive of a possible panic-attack pattern "
         f"({panic_type}). This is decision-support information, not a medical diagnosis.\n"
         f"Location: {_location_line(emergency)}\n"
+        f"Nearest hospital: {_hospital_line(nearest_hospital)}\n"
         f"Time: {emergency.get('updatedAt')}\n"
         f"Vitals snapshot: {_vitals_snapshot(reading)}\n"
         "Immediate assistance requested."
     )
 
 
-def hospital_escalation_message(patient: Dict[str, Any], emergency: Dict[str, Any]) -> str:
+def hospital_escalation_message(patient: Dict[str, Any], emergency: Dict[str, Any], nearest_hospital: Optional[Dict[str, Any]] = None) -> str:
     reading = emergency.get("reading")
     return (
         "MediLink auto-escalation: registered emergency contact did not acknowledge in time.\n"
@@ -46,6 +55,7 @@ def hospital_escalation_message(patient: Dict[str, Any], emergency: Dict[str, An
         "has an unresolved abnormal-vitals alert suggestive of a possible panic-attack pattern "
         f"({emergency.get('panicAttackType', 'UNKNOWN')}). Decision-support only, not a diagnosis.\n"
         f"Location: {_location_line(emergency)}\n"
+        f"Nearest hospital: {_hospital_line(nearest_hospital)}\n"
         f"Time: {emergency.get('updatedAt')}\n"
         f"Vitals snapshot: {_vitals_snapshot(reading)}\n"
         "Please assess for dispatch/response as appropriate."

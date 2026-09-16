@@ -425,7 +425,12 @@ class _AuthPageState extends ConsumerState<AuthPage> {
             );
       await ref.read(sessionProvider.notifier).saveAuth(payload);
       unawaited(FcmService(ref.read(apiClientProvider)).initializeAndRegister());
-      if (mounted) context.go(widget.login ? '/app' : '/permissions');
+      // amends/51-52: previously only a brand-new signup ever saw this screen, so a returning
+      // login after a fresh install (permissions reset by the OS on uninstall) never got asked
+      // for location at all -- it only ever got requested reactively, mid-emergency, too late to
+      // matter for a no-response timeout. PermissionsPage itself skips straight through when
+      // everything's already granted, so this costs an already-set-up user nothing.
+      if (mounted) context.go('/permissions');
     } on ApiException catch (e) {
       if (mounted) setState(() => _error = e.message);
     } finally {
@@ -434,80 +439,175 @@ class _AuthPageState extends ConsumerState<AuthPage> {
   }
 }
 
-class PermissionsPage extends StatelessWidget {
+class PermissionsPage extends StatefulWidget {
   const PermissionsPage({super.key});
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Permissions')),
-    body: Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Set up safe monitoring',
-            style: Theme.of(context).textTheme.headlineSmall
-                ?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 12),
-          const Text(
-            'MEDILINK uses Bluetooth, location, and notifications only for connected care.',
-          ),
-          const SizedBox(height: 24),
-          const Expanded(
-            child: Column(
-              children: [
-                PermissionTile(
-                  icon: Icons.bluetooth_outlined,
-                  title: 'Bluetooth',
-                  permission: Permission.bluetoothScan,
-                ),
-                PermissionTile(
-                  icon: Icons.location_on_outlined,
-                  title: 'Location',
-                  permission: Permission.location,
-                ),
-                PermissionTile(
-                  icon: Icons.notifications_outlined,
-                  title: 'Notifications',
-                  permission: Permission.notification,
-                ),
-              ],
-            ),
-          ),
-          PrimaryButton(
-            label: 'Continue to MEDILINK',
-            onPressed: () => context.go('/app'),
-            icon: Icons.arrow_forward,
-          ),
-        ],
-      ),
-    ),
-  );
+  State<PermissionsPage> createState() => _PermissionsPageState();
 }
 
-class PermissionTile extends StatelessWidget {
+class _PermissionsPageState extends State<PermissionsPage> {
+  // amends/51-52: previously this screen was signup-only and had no way to tell whether
+  // permissions were already granted -- a returning user after a fresh reinstall (permissions
+  // reset by the OS) never saw it at all, so location was never requested proactively, only
+  // reactively mid-emergency. Auto-skipping when everything's already granted keeps this free
+  // for an already-set-up user while still reliably prompting a fresh install.
+  bool _checkedInitialSkip = false;
+
+  Future<void> _maybeAutoSkip() async {
+    final granted = await Future.wait([
+      Permission.bluetoothScan.isGranted,
+      Permission.location.isGranted,
+      Permission.notification.isGranted,
+    ]);
+    if (mounted && granted.every((g) => g)) {
+      context.go('/app');
+    } else if (mounted) {
+      setState(() => _checkedInitialSkip = true);
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _maybeAutoSkip();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_checkedInitialSkip) {
+      return const Scaffold(body: LoadingState(label: 'Checking permissions...'));
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text('Permissions')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Set up safe monitoring',
+              style: Theme.of(context).textTheme.headlineSmall
+                  ?.copyWith(fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'MEDILINK uses Bluetooth, location, and notifications only for connected care.',
+            ),
+            const SizedBox(height: 24),
+            const Expanded(
+              child: Column(
+                children: [
+                  PermissionTile(
+                    icon: Icons.bluetooth_outlined,
+                    title: 'Bluetooth',
+                    explanation: 'Needed to connect to your wearable device.',
+                    permission: Permission.bluetoothScan,
+                  ),
+                  PermissionTile(
+                    icon: Icons.location_on_outlined,
+                    title: 'Location',
+                    explanation:
+                        'Used only during a real emergency, to tell your caretakers and the nearest hospital where you are.',
+                    permission: Permission.location,
+                  ),
+                  PermissionTile(
+                    icon: Icons.notifications_outlined,
+                    title: 'Notifications',
+                    explanation: 'Alerts you and your care team the moment something needs attention.',
+                    permission: Permission.notification,
+                  ),
+                ],
+              ),
+            ),
+            PrimaryButton(
+              label: 'Continue to MEDILINK',
+              onPressed: () => context.go('/app'),
+              icon: Icons.arrow_forward,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class PermissionTile extends StatefulWidget {
   const PermissionTile({
     super.key,
     required this.icon,
     required this.title,
+    required this.explanation,
     required this.permission,
   });
   final IconData icon;
   final String title;
+  final String explanation;
   final Permission permission;
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.only(bottom: 12),
-    child: SectionCard(
-      child: ListTile(
-        leading: Icon(icon, color: MedilinkColors.blue),
-        title: Text(title),
-        trailing: TextButton(
-          onPressed: () => permission.request(),
-          child: const Text('Allow'),
+  State<PermissionTile> createState() => _PermissionTileState();
+}
+
+class _PermissionTileState extends State<PermissionTile> {
+  PermissionStatus? _status;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.permission.status.then((s) {
+      if (mounted) setState(() => _status = s);
+    });
+  }
+
+  Future<void> _request() async {
+    final result = await widget.permission.request();
+    if (mounted) setState(() => _status = result);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final granted = _status?.isGranted ?? false;
+    // Only true after an actual request came back denied -- never shown before the first tap,
+    // so a permission nobody has asked about yet doesn't read as "you already said no".
+    final deniedAfterAsking = _status != null && !granted;
+    final permanentlyDenied = _status?.isPermanentlyDenied ?? false;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: SectionCard(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(widget.icon, color: MedilinkColors.blue),
+                title: Text(widget.title),
+                trailing: granted
+                    ? const Icon(Icons.check_circle, color: MedilinkColors.teal)
+                    : TextButton(
+                        onPressed: permanentlyDenied ? openAppSettings : _request,
+                        child: Text(permanentlyDenied ? 'Open Settings' : 'Allow'),
+                      ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
+                child: Text(
+                  // Clear explanation + a real way to retry (the same button, re-tappable) when
+                  // denied, rather than the permission silently failing later mid-emergency.
+                  deniedAfterAsking
+                      ? (permanentlyDenied
+                            ? '${widget.explanation} Denied permanently -- enable it in Settings, then come back here.'
+                            : '${widget.explanation} You said no -- tap Allow to try again.')
+                      : widget.explanation,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: deniedAfterAsking ? MedilinkColors.amber : null,
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }

@@ -25,6 +25,14 @@ class EmergencyCancelRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class EmergencyNoResponseRequest(BaseModel):
+    # amends/51-52: the confirmation countdown expiring with no response is not the patient
+    # tapping anything, so this never carries a patientResponse -- only whatever location the
+    # app managed to capture in the background during the countdown (may be absent, e.g.
+    # permission denied or no fix yet), the same optional field /confirm already accepts.
+    location: Optional[LocationPoint] = None
+
+
 class EmergencyAcknowledgeRequest(BaseModel):
     responderId: Optional[str] = None
     status: EmergencyStatus = EmergencyStatus.ACKNOWLEDGED

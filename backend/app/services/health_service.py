@@ -2,8 +2,10 @@ from pymongo import DESCENDING
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.repositories.base import MongoRepository
+from app.risk import prediction_logger
 from app.risk.hybrid_engine import HybridRiskEngine
 from app.risk.panic_engine import PanicAssessment, PanicEngine
+from app.risk.tiers import tier_for
 from app.schemas.health import HealthReadingCreate, RiskResult
 from app.utils.time import utcnow
 
@@ -12,7 +14,7 @@ class HealthService:
     def __init__(self, db: AsyncIOMotorDatabase, risk_engine: HybridRiskEngine | None = None, panic_engine: PanicEngine | None = None):
         self.db = db
         self.repo = MongoRepository(db, "health_readings")
-        self.risk_engine = risk_engine or HybridRiskEngine()
+        self.risk_engine = risk_engine or HybridRiskEngine(db)
         self.panic_engine = panic_engine or PanicEngine(db)
 
     async def record_reading(self, payload: HealthReadingCreate) -> tuple[dict, RiskResult, PanicAssessment]:
@@ -30,12 +32,18 @@ class HealthService:
         risk.panicPatternDetected = panic.panic_pattern_detected
         risk.panicAttackType = panic.panic_attack_type
         risk.motionDetected = panic.motion_detected
+        risk.tierPrediction = panic.tier_category
         if panic.engine_used == "ML" and risk.engineUsed == "ML":
             risk.modelVersion = f"{risk.modelVersion}+{panic.model_version}"
         risk.engineUsed = engine_used
 
         reading["risk"] = risk.model_dump(mode="json")
         stored = await self.repo.insert(reading)
+
+        prediction_logger.log_prediction(
+            payload.patientId, reading["timestamp"], panic.tier_category or panic.panic_attack_type.value,
+            tier_for(panic.tier_category, panic.panic_attack_type.value),
+        )
         return stored, risk, panic
 
     async def current(self, patient_id: str) -> dict | None:

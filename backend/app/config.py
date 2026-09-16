@@ -52,7 +52,25 @@ class Settings(BaseSettings):
     # Phase 20: motion-aware supervision mode & tiered escalation timing (all configurable,
     # never hardcoded inline in the routing logic).
     supervision_timeout_minutes: int = 7
+    # Superseded by app.risk.tiers.TIER_1_RESPONSE_SECONDS (the AI engine rebuild's single shared
+    # source for the patient-confirmation countdown, used by both manual SOS and AI-detected
+    # Tier 1). Left in place, unread by that code path, rather than deleted.
     patient_confirmation_seconds: int = 30
+    # How many consecutive anomalous readings (from the general-anomaly detector, risk_model_v3)
+    # are required before an anomaly is allowed to escalate a patient's risk level at all -- a
+    # single isolated spike (sensor noise) never escalates on its own. Bypassed entirely when the
+    # always-on threshold layer (app/risk/threshold_layer.py) flags a reading critical.
+    anomaly_persistence_readings: int = 2
+    # IsolationForest decision_function score below which a persisted anomaly is treated as
+    # HIGH_RISK rather than WARNING. This is a documented heuristic, not a calibrated clinical
+    # boundary -- Isolation Forest is unsupervised and there's no labeled ground truth to fit
+    # against yet. Revisit once real (or better-labeled synthetic) data is available.
+    anomaly_high_risk_score: float = -0.10
+    # Debug-only: writes every reading's predicted panic class/tier to
+    # backend/validation/predictions.csv for the blind-dataset replay validation workflow.
+    # Backend equivalent of Flutter's kDebugMode gating -- defaults off so it's never silently
+    # active in a production deployment.
+    debug_log_predictions: bool = False
     contact_ack_window_minutes: int = 5
     escalation_sweep_interval_seconds: int = 20
     # How often the 3-caretaker priority loop advances to the next contact (wrapping back to

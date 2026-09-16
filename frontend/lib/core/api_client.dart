@@ -205,10 +205,10 @@ class ApiClient {
   Future<Map<String, dynamic>> getEmergency(String id) async =>
       Map<String, dynamic>.from(await get('/emergencies/$id') as Map);
 
-  /// Closes an emergency for good (hospital accounts only, per the backend's role check).
-  /// An emergency left open blocks every future emergency for that patient, since the backend
-  /// won't open a second one while one is still active -- so resolving is what frees the patient
-  /// to be alerted again, not just a tidy-up action.
+  /// Closes an emergency for good (hospital accounts, or the patient themself, per the backend's
+  /// owner-or-role check). An emergency left open blocks every future emergency for that patient,
+  /// since the backend won't open a second one while one is still active -- so resolving is what
+  /// frees the patient to be alerted again, not just a tidy-up action.
   Future<Map<String, dynamic>> resolveEmergency(String emergencyId, {String? notes}) async =>
       Map<String, dynamic>.from(await post('/emergencies/$emergencyId/resolve', body: {
         if (notes != null && notes.isNotEmpty) 'resolutionNotes': notes,

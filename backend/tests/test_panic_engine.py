@@ -74,9 +74,22 @@ async def test_reported_trigger_classifies_situational():
 async def test_nighttime_reading_classifies_nocturnal():
     from datetime import datetime, timezone
     engine = PanicEngine(db=_FakeDb(), model=None)
-    r = reading(timestamp=datetime(2026, 1, 1, 2, 30, tzinfo=timezone.utc))
+    # 20:00 UTC = 01:30 IST (next day) -- genuinely nighttime once converted to IST, unlike the
+    # raw UTC hour, which is what _is_nighttime must check (Task 1's IST conversion fix).
+    r = reading(timestamp=datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc))
     result = await engine.assess(r, RiskLevel.HIGH_RISK)
     assert result.panic_attack_type == PanicAttackType.NOCTURNAL
+
+
+@pytest.mark.asyncio
+async def test_daytime_ist_not_misclassified_as_nocturnal_from_raw_utc():
+    """Regression guard for the IST-conversion bug: 02:30 UTC is nighttime by raw UTC hour, but
+    it's 08:00 IST -- broad daylight -- so this must NOT classify as NOCTURNAL."""
+    from datetime import datetime, timezone
+    engine = PanicEngine(db=_FakeDb(), model=None)
+    r = reading(timestamp=datetime(2026, 1, 1, 2, 30, tzinfo=timezone.utc))
+    result = await engine.assess(r, RiskLevel.HIGH_RISK)
+    assert result.panic_attack_type != PanicAttackType.NOCTURNAL
 
 
 @pytest.mark.asyncio

@@ -138,14 +138,18 @@ def test_three_consecutive_emergencies_over_http_produce_three_ids_and_three_cal
     assert len({a["emergencyId"] for a in call_attempts}) == 3
 
 
-def test_resolve_endpoint_is_hospital_only_and_frees_the_patient(client_as, client_db):
-    """Confirms the Flutter-side gating (role == 'HOSPITAL') matches what the server actually
-    enforces on POST /api/emergencies/{id}/resolve, and that resolving is what allows a second
-    emergency to open for the same patient."""
+def test_resolve_endpoint_allows_owning_patient_or_hospital_and_frees_the_patient(client_as, client_db):
+    """POST /api/emergencies/{id}/resolve must be reachable by the patient who owns the emergency
+    (the "I'm safe now" fallback once an emergency is past VERIFICATION, since auto-resolve
+    depends on consecutive NORMAL readings that may never arrive) or by a hospital account acting
+    on the patient's behalf -- but not by an unrelated account. Resolving either way is what frees
+    the patient to be alerted again."""
     pid = str(ObjectId())
+    other_pid = str(ObjectId())
 
     async def seed():
         await client_db.users.insert_one({"_id": ObjectId(pid), "name": "Test Patient", "age": 35, "role": "PATIENT"})
+        await client_db.users.insert_one({"_id": ObjectId(other_pid), "name": "Other Patient", "age": 40, "role": "PATIENT"})
 
     asyncio.new_event_loop().run_until_complete(seed())
     patient_client = client_as("PATIENT", pid)
@@ -154,24 +158,27 @@ def test_resolve_endpoint_is_hospital_only_and_frees_the_patient(client_as, clie
     first_emergency_id = r.json()["emergency"]["id"]
     patient_client.post(f"/api/emergencies/{first_emergency_id}/confirm", json={"patientResponse": "NEED_HELP"})
 
-    # A non-hospital role, including the patient themself, is rejected -- matches the audit's
-    # observation that no client ever called this endpoint, and the Flutter gating this fix adds.
-    r = patient_client.post(f"/api/emergencies/{first_emergency_id}/resolve", json={"resolutionNotes": "n/a"})
+    # An unrelated account (not the owning patient, not a hospital) is rejected.
+    other_patient_client = client_as("PATIENT", other_pid)
+    r = other_patient_client.post(f"/api/emergencies/{first_emergency_id}/resolve", json={"resolutionNotes": "n/a"})
     assert r.status_code == 403
 
     # While still open, a second high-risk reading does NOT open a new emergency.
+    patient_client = client_as("PATIENT", pid)
     r = patient_client.post("/api/health/readings", json={"patientId": pid, **HIGH_RISK_READING})
     assert r.json()["emergency"]["id"] == first_emergency_id
 
-    hospital_client = client_as("HOSPITAL", str(ObjectId()))
-    r = hospital_client.post(f"/api/emergencies/{first_emergency_id}/resolve", json={"resolutionNotes": "Handled."})
+    # The owning patient can resolve their own emergency -- this is the "I'm safe now" fallback.
+    r = patient_client.post(f"/api/emergencies/{first_emergency_id}/resolve", json={"resolutionNotes": "Marked safe by patient"})
     assert r.status_code == 200
     assert r.json()["status"] == "RESOLVED"
 
-    # app.dependency_overrides is global on the shared FastAPI app, not per-TestClient-instance --
-    # creating hospital_client above re-pointed get_current_user at the hospital identity for
-    # every client, patient_client included. Re-authenticate as the patient before the final call.
-    patient_client = client_as("PATIENT", pid)
     r = patient_client.post("/api/health/readings", json={"patientId": pid, **HIGH_RISK_READING})
     second_emergency_id = r.json()["emergency"]["id"]
     assert second_emergency_id != first_emergency_id
+
+    patient_client.post(f"/api/emergencies/{second_emergency_id}/confirm", json={"patientResponse": "NEED_HELP"})
+    hospital_client = client_as("HOSPITAL", str(ObjectId()))
+    r = hospital_client.post(f"/api/emergencies/{second_emergency_id}/resolve", json={"resolutionNotes": "Handled."})
+    assert r.status_code == 200
+    assert r.json()["status"] == "RESOLVED"

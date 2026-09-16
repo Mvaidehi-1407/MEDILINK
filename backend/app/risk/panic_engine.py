@@ -2,13 +2,14 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.config import Settings, get_settings
 from app.models.enums import EmergencyStatus, MotionState, PanicAttackType, RiskLevel
-from app.risk.ml_model import PanicModel, load_panic_model
+from app.risk.ml_model import PanicModel, TierClassifierModel, load_panic_model, load_tier_classifier, load_tier_sensor_schema
 from app.schemas.health import HealthReadingCreate
 
 logger = logging.getLogger("medilink.risk.panic")
@@ -18,6 +19,7 @@ _INFERENCE_TIMEOUT_SECONDS = 2.0
 # reliable enough to report as a specific type. Store UNKNOWN rather than guess.
 _MIN_RELIABLE_CONFIDENCE = 0.35
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="panic-ml")
+_IST = ZoneInfo("Asia/Kolkata")
 
 _LABELS = [t.value for t in PanicAttackType if t != PanicAttackType.UNKNOWN]
 
@@ -32,6 +34,7 @@ class PanicAssessment:
         engine_used: str,
         model_version: str | None,
         route_to_supervision: bool,
+        tier_category: str | None = None,
     ):
         self.panic_pattern_detected = panic_pattern_detected
         self.panic_attack_type = panic_attack_type
@@ -40,6 +43,10 @@ class PanicAssessment:
         self.engine_used = engine_used
         self.model_version = model_version
         self.route_to_supervision = route_to_supervision
+        # tier_classifier.joblib's normal/false_alarm/real_panic call -- the primary tier
+        # decision (see app/risk/tiers.py:response_seconds()). None means the model didn't run
+        # (unavailable/timed out), not that it predicted "normal".
+        self.tier_category = tier_category
 
 
 class PanicEngine:
@@ -63,10 +70,15 @@ class PanicEngine:
        -> Conservative safety rule: treated as stationary ("no motion") so emergencies are never silenced.
     """
 
-    def __init__(self, db: AsyncIOMotorDatabase, settings: Settings | None = None, model: PanicModel | None | object = "unset"):
+    def __init__(
+        self, db: AsyncIOMotorDatabase, settings: Settings | None = None,
+        model: PanicModel | None | object = "unset",
+        tier_classifier: TierClassifierModel | None | object = "unset",
+    ):
         self.db = db
         self.settings = settings or get_settings()
         self._model = load_panic_model() if model == "unset" else model
+        self._tier_classifier = load_tier_classifier() if tier_classifier == "unset" else tier_classifier
 
     async def assess(self, reading: HealthReadingCreate, risk_level: RiskLevel) -> PanicAssessment:
         """Evaluates patient telemetry, classifies panic attack subtype, and determines routing."""
@@ -96,6 +108,11 @@ class PanicEngine:
         has_trigger = bool(getattr(reading, "reportedTrigger", None))
         prior_episodes = await self._prior_episode_count(reading.patientId)
 
+        # 3b. Primary tier decision: tier_classifier.joblib on the 4 shared sensor features
+        # (heart_rate_bpm, spo2_percent, motion_level, is_nighttime) -- independent of, and run
+        # alongside, the 6-class panic_attack_type classification below.
+        tier_category = await self._try_tier_classifier(reading, is_nighttime)
+
         # 4. Primary ML Path: Run trained 6-class GradientBoostingClassifier
         ml_result = await self._try_ml(reading, motion_state, is_nighttime, has_trigger, prior_episodes)
         if ml_result is not None:
@@ -112,6 +129,7 @@ class PanicEngine:
                 engine_used="ML",
                 model_version=self._model.version,
                 route_to_supervision=route_to_supervision,
+                tier_category=tier_category,
             )
 
         # 5. Deterministic Rule Fallback Path
@@ -124,7 +142,47 @@ class PanicEngine:
             engine_used="RULE_FALLBACK",
             model_version=None,
             route_to_supervision=route_to_supervision,
+            tier_category=tier_category,
         )
+
+    async def _try_tier_classifier(self, reading: HealthReadingCreate, is_nighttime: bool) -> str | None:
+        """Runs the tier classifier (tier_classifier_v3.joblib, or the older 4-feature model if
+        that's what's loaded -- TierClassifierModel.predict() handles either shape generically).
+        Returns None (caller falls back to the panic_attack_type tier mapping) if the model is
+        unavailable, times out, or errors -- never raises."""
+        if self._tier_classifier is None:
+            return None
+        try:
+            motion_level = 0.0
+            if reading.motion is not None and reading.motion.intensity is not None:
+                # Same 0-1 -> 0-10 scaling hybrid_engine's anomaly path uses, so both models see
+                # motion on the scale they were trained on (dataset/simulator's 0-10 range).
+                motion_level = reading.motion.intensity * 10
+            # eda_gsr_level/skin_temp_c/prv_ms are OPTIONAL (amends/48e) -- absent entirely on a
+            # 3-sensor wearable. TierClassifierModel.predict() imputes whichever of these its
+            # loaded bundle actually needs and the caller doesn't have; on the old 4-feature model
+            # they're simply never read since they're not in its `features` list.
+            sensor_values = {
+                "heart_rate_bpm": float(reading.heartRate),
+                "spo2_percent": float(reading.spo2),
+                "motion_level": motion_level,
+                "eda_gsr_level": reading.eda_gsr_level,
+                "skin_temp_c": reading.skin_temp_c,
+                "prv_ms": reading.prv_ms,
+            }
+            schema = load_tier_sensor_schema()
+            loop = asyncio.get_running_loop()
+            category, _confidence = await asyncio.wait_for(
+                loop.run_in_executor(
+                    _executor, self._tier_classifier.predict,
+                    sensor_values, is_nighttime, schema,
+                ),
+                timeout=_INFERENCE_TIMEOUT_SECONDS,
+            )
+            return category
+        except (asyncio.TimeoutError, Exception):
+            logger.warning("Tier classifier inference failed or timed out; falling back to panic_attack_type tier mapping.", exc_info=True)
+            return None
 
     async def _try_ml(
         self, reading: HealthReadingCreate, motion_state: MotionState, is_nighttime: bool, has_trigger: bool, prior_episodes: int,
@@ -173,10 +231,14 @@ class PanicEngine:
 
     @staticmethod
     def _is_nighttime(timestamp: datetime | None) -> bool:
-        """Determines if the timestamp falls between 22:00 (10 PM) and 06:00 (6 AM)."""
+        """Determines if the timestamp falls between 22:00 (10 PM) and 06:00 (6 AM) IST (India
+        Standard Time, UTC+5:30) -- converted from the reading's (UTC) timestamp first, since
+        checking the raw UTC hour against an IST night window would be off by 5:30."""
         ts = timestamp or datetime.now(timezone.utc)
-        hour = ts.hour
-        return hour >= 22 or hour < 6
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ist_hour = ts.astimezone(_IST).hour
+        return ist_hour >= 22 or ist_hour < 6
 
     async def _prior_episode_count(self, patient_id: str) -> int:
         """Queries MongoDB for historical non-cancelled panic events for this patient."""

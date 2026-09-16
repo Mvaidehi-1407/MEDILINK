@@ -15,6 +15,18 @@ PHYSIOLOGICAL_RANGES = {
     "heart_rate_bpm": (30, 220),
     "spo2_percent": (70, 100),
     "motion_level": (0, 10),
+    # Skin conductance (galvanic skin response), microsiemens (uS). Resting baseline is typically
+    # 1-5 uS; strong sympathetic arousal (fear, exertion) can push it well past 20 uS. Below 0 is
+    # not physically meaningful for a conductance measurement.
+    "eda_gsr_level": (0, 40),
+    # Peripheral (wrist) skin temperature, Celsius -- distinct from core body temperature, and
+    # normally several degrees below it. Vasoconstriction (panic, cold) or vasodilation (exercise,
+    # heat) can swing it further than core temp would ever move.
+    "skin_temp_c": (25, 40),
+    # Pulse rate variability (beat-to-beat interval variability), ms. Near-zero under acute
+    # sympathetic dominance (severe panic/stress) up to well over 100ms for a highly vagal,
+    # well-rested individual.
+    "prv_ms": (0, 200),
 }
 
 
@@ -42,7 +54,7 @@ def check_duplicates(rows):
     for r in rows:
         key = (
             r["sequence_id"], r["heart_rate_bpm"], r["spo2_percent"],
-            r["motion_level"],
+            r["motion_level"], r["eda_gsr_level"], r["skin_temp_c"], r["prv_ms"],
         )
         seen[key] += 1
     for key, count in seen.items():

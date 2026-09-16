@@ -10,6 +10,7 @@ from app.emergency.state_machine import assert_transition
 from app.models.enums import ConsentStatus, EmergencyStatus, EscalationStage, PatientResponse, UserRole
 from app.repositories.base import MongoRepository
 from app.risk.panic_engine import PanicAssessment
+from app.risk.tiers import TIER_1_RESPONSE_SECONDS, response_seconds
 from app.schemas.emergency import EmergencyCancelRequest, EmergencyConfirmRequest, EmergencyCreate
 from app.schemas.health import RiskResult
 from app.services.calling_service import CallingService
@@ -70,7 +71,9 @@ class EmergencyService:
             "status": EmergencyStatus.VERIFICATION.value,
             "timeline": [
                 {"event": "DETECTED", "timestamp": now, "details": {"trigger": payload.trigger}},
-                {"event": "VERIFICATION", "timestamp": now, "details": {"countdownSeconds": self.settings.patient_confirmation_seconds}},
+                # Manual SOS always uses TIER_1_RESPONSE_SECONDS -- the same shared constant an
+                # AI-detected Tier 1 case uses, never a separately configured value.
+                {"event": "VERIFICATION", "timestamp": now, "details": {"countdownSeconds": TIER_1_RESPONSE_SECONDS}},
             ],
             "notificationStatus": {},
             "callStatus": {},
@@ -137,11 +140,17 @@ class EmergencyService:
         return emergency
 
     def _new_emergency_doc(self, reading: dict, risk: RiskResult, panic: PanicAssessment, *, status: EmergencyStatus, now, supervision_mode: bool, supervision_started_at, escalation_stage: EscalationStage) -> dict:
+        # Tier only ever picks the VERIFICATION countdown length -- it never changes which status
+        # is chosen (that's still decided purely by the motion-aware routing above/in
+        # route_reading()). Threshold-critical readings always force Tier 1, regardless of the
+        # panic classification.
+        threshold_critical = risk.engineUsed == "THRESHOLD_CRITICAL"
+        countdown_seconds = response_seconds(panic.tier_category, panic.panic_attack_type.value, threshold_critical=threshold_critical)
         timeline = [{"event": "DETECTED", "timestamp": now, "details": {"trigger": "PANIC_PATTERN" if panic.panic_pattern_detected else "HIGH_RISK"}}]
         timeline.append({"event": status.value, "timestamp": now, "details": {
             "motionDetected": panic.motion_detected,
             "panicAttackType": panic.panic_attack_type.value,
-            **({"countdownSeconds": self.settings.patient_confirmation_seconds} if status == EmergencyStatus.VERIFICATION else {}),
+            **({"countdownSeconds": countdown_seconds} if status == EmergencyStatus.VERIFICATION else {}),
         }})
         return {
             "patientId": reading["patientId"],
@@ -156,6 +165,10 @@ class EmergencyService:
             "nearbyHospitals": [],
             "panicPatternDetected": panic.panic_pattern_detected,
             "panicAttackType": panic.panic_attack_type.value,
+            # tier_classifier's category, persisted so later re-evaluation (supervision timeout,
+            # sweep) uses the same primary tier decision instead of falling back to
+            # panicAttackType. None means the model didn't run for this reading.
+            "tierCategory": panic.tier_category,
             "motionDetected": panic.motion_detected,
             "supervisionMode": supervision_mode,
             "supervisionStartedAt": supervision_started_at,
@@ -240,9 +253,13 @@ class EmergencyService:
             return updated
 
         if elapsed >= timeout:
+            threshold_critical = risk.engineUsed == "THRESHOLD_CRITICAL"
+            countdown_seconds = response_seconds(
+                emergency.get("tierCategory"), emergency.get("panicAttackType", "NONE_DETECTED"), threshold_critical=threshold_critical,
+            )
             updated = await self._transition(
                 emergency, EmergencyStatus.VERIFICATION,
-                {"reason": "supervision_timeout_exceeded", "countdownSeconds": self.settings.patient_confirmation_seconds},
+                {"reason": "supervision_timeout_exceeded", "countdownSeconds": countdown_seconds},
                 {"supervisionResolvedAt": now, "escalationStage": EscalationStage.PATIENT_ALERTED.value},
             )
             await self._log(emergency["id"], emergency["patientId"], "supervisionEscalated", updated)
@@ -264,9 +281,10 @@ class EmergencyService:
         }):
             emergency = await self.emergencies.get(str(emergency["_id"]))
             try:
+                countdown_seconds = response_seconds(emergency.get("tierCategory"), emergency.get("panicAttackType", "NONE_DETECTED"))
                 updated = await self._transition(
                     emergency, EmergencyStatus.VERIFICATION,
-                    {"reason": "supervision_timeout_exceeded", "countdownSeconds": self.settings.patient_confirmation_seconds},
+                    {"reason": "supervision_timeout_exceeded", "countdownSeconds": countdown_seconds},
                     {"supervisionResolvedAt": now, "escalationStage": EscalationStage.PATIENT_ALERTED.value},
                 )
                 await self._log(emergency["id"], emergency["patientId"], "supervisionEscalated", updated)
@@ -337,6 +355,18 @@ class EmergencyService:
         updated = await self._notify_stage1_contacts(updated)
         return updated
 
+    async def _nearest_hospital(self, emergency: dict) -> dict | None:
+        """Best-effort nearest-hospital lookup for escalation SMS -- returns None (never blocks or
+        delays the alert) when the emergency has no location yet or Overpass doesn't answer."""
+        location = emergency.get("location")
+        if not location:
+            return None
+        coords = location.get("coordinates", [None, None])
+        longitude, latitude = coords[0], coords[1]
+        if latitude is None or longitude is None:
+            return None
+        return await self.location.nearest_hospital_overpass(latitude, longitude)
+
     def _next_attempt_delay(self, attempt_status: str) -> timedelta:
         if attempt_status == "NO_DEVICE_CONNECTED":
             return timedelta(seconds=self.settings.caretaker_reconnect_retry_seconds)
@@ -357,7 +387,8 @@ class EmergencyService:
 
         patient_doc = serialize_doc(await self.db.users.find_one({"_id": object_id(emergency["patientId"])})) or {}
         contacts = await self._ordered_caretakers(emergency["patientId"])
-        message = contact_alert_message(patient_doc, emergency)
+        nearest_hospital = await self._nearest_hospital(emergency)
+        message = contact_alert_message(patient_doc, emergency, nearest_hospital)
 
         if not contacts:
             logger.info("No emergency contacts on file for patient %s; escalating straight to hospital.", emergency["patientId"])
@@ -411,7 +442,8 @@ class EmergencyService:
         contact = contacts[next_priority - 1]
 
         patient_doc = serialize_doc(await self.db.users.find_one({"_id": object_id(emergency["patientId"])})) or {}
-        message = contact_alert_message(patient_doc, emergency)
+        nearest_hospital = await self._nearest_hospital(emergency)
+        message = contact_alert_message(patient_doc, emergency, nearest_hospital)
         attempt = await self.calls.relay_to_patient_device(emergency["patientId"], contact, emergency["id"], message, cycle=cycle, priority=next_priority)
 
         now = utcnow()
@@ -469,7 +501,8 @@ class EmergencyService:
         from app.utils.mongo import object_id, serialize_doc
 
         patient_doc = serialize_doc(await self.db.users.find_one({"_id": object_id(emergency["patientId"])})) or {}
-        message = hospital_escalation_message(patient_doc, emergency)
+        nearest_hospital = await self._nearest_hospital(emergency)
+        message = hospital_escalation_message(patient_doc, emergency, nearest_hospital)
 
         hospital_call_status = await self._call_hospitals(emergency["id"], message)
         updated = await self.emergencies.update(emergency["id"], {"$set": {

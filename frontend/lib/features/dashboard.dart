@@ -58,12 +58,22 @@ class _RoleShellState extends ConsumerState<RoleShell> {
   RealtimeConnection? _escalationConnection;
   StreamSubscription? _escalationSubscription;
   String? _escalationPatientId;
+  // The emergency this session has already auto-opened the countdown screen for -- guards
+  // against re-pushing a second copy of the screen on a repeated emergency.updated push for the
+  // same still-open emergency (e.g. a later SUPERVISION->VERIFICATION escalation echo).
+  String? _autoNavigatedEmergencyId;
 
   // The native SMS/call bridge must stay live for the entire patient session, not just while the
   // Home tab happens to be visible -- RoleShell swaps `views[index]` in and out of the tree on
   // every tab change (and pushed routes like the confirmation screen sit on top of
   // this same shell), so a listener living inside one tab's widget gets disposed the moment the
   // patient navigates away, silently dropping every escalation.attempt that arrives after that.
+  // amends/51-52: this is also the ONLY place that can react to a brand-new AI-detected
+  // emergency regardless of which tab is showing -- EmergencyPage's own realtime subscription
+  // only starts once it already knows an emergency ID (manual SOS, or a pushed route that
+  // already named one), so a server-triggered emergency previously had NO listener anywhere
+  // that would ever navigate the patient to the confirmation countdown. That's the root cause
+  // fixed here: this listener also watches for emergency.updated now, not just escalation.attempt.
   void _ensureEscalationListener(String? role, String patientId) {
     if (role != 'PATIENT' || patientId.isEmpty) return;
     if (_escalationPatientId == patientId && _escalationConnection != null) return;
@@ -72,13 +82,32 @@ class _RoleShellState extends ConsumerState<RoleShell> {
     _escalationPatientId = patientId;
     _escalationConnection = RealtimeService(ref.read(sessionProvider.notifier), ref.read(apiClientProvider)).patientChannel(patientId);
     _escalationSubscription = _escalationConnection!.events.listen((event) {
-      if (event['event'] != 'escalation.attempt') return;
-      final data = Map<String, dynamic>.from(event['data'] as Map);
-      final emergencyId = data['emergencyId']?.toString();
-      if (emergencyId != null) {
-        NativeCommService().handleEscalationAttempt(ref.read(apiClientProvider), emergencyId, data);
+      final name = event['event'];
+      if (name == 'escalation.attempt') {
+        final data = Map<String, dynamic>.from(event['data'] as Map);
+        final emergencyId = data['emergencyId']?.toString();
+        if (emergencyId != null) {
+          NativeCommService().handleEscalationAttempt(ref.read(apiClientProvider), emergencyId, data);
+        }
+        return;
+      }
+      if (name == 'emergency.updated') {
+        _maybeAutoNavigateToConfirmation(event['data']);
       }
     });
+  }
+
+  /// A missed patient-confirmation countdown is the worst possible outcome (same rationale as
+  /// the countdown screen's own always-on haptic pulse) -- so the moment the server opens a
+  /// VERIFICATION-stage emergency for this patient, put the countdown in front of them
+  /// immediately, without waiting for them to happen to open the Emergency tab themselves.
+  void _maybeAutoNavigateToConfirmation(dynamic data) {
+    if (data is! Map) return;
+    if (data['status']?.toString() != 'VERIFICATION') return;
+    final id = data['id']?.toString();
+    if (id == null || id == _autoNavigatedEmergencyId) return;
+    _autoNavigatedEmergencyId = id;
+    if (mounted) _open(context, EmergencyPage(emergencyId: id));
   }
 
   @override
@@ -238,7 +267,12 @@ class ActionTile extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.center,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, color: MedilinkColors.blue),
+            // Fixed-height box so every icon occupies the same footprint before the label,
+            // regardless of that particular Material glyph's own internal bounds.
+            SizedBox(
+              height: 28,
+              child: Center(child: Icon(icon, size: 26, color: MedilinkColors.blue)),
+            ),
             const SizedBox(height: 6),
             Text(
               label,
@@ -316,7 +350,7 @@ class _PatientHomeState extends ConsumerState<PatientHome> {
           HealthStatusCard(patientId: id),
           const SizedBox(height: 16),
           AiInsightCard(reading: reading),
-          const SizedBox(height: 20),
+          const SizedBox(height: 16),
           Wrap(
             spacing: 10,
             runSpacing: 10,
@@ -492,12 +526,6 @@ class HealthPage extends ConsumerWidget {
                 ],
               ),
             ),
-          ),
-          const SizedBox(height: 16),
-          PrimaryButton(
-            label: 'BLE devices',
-            onPressed: () => _open(context, const BlePage()),
-            icon: Icons.bluetooth_outlined,
           ),
         ],
       ),
@@ -1056,15 +1084,11 @@ class BleNoDeviceCard extends ConsumerWidget {
             const LinearProgressIndicator(minHeight: 3),
           ],
           if (!connected) ...[
-            const SizedBox(height: 8),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton.icon(
-                style: TextButton.styleFrom(minimumSize: const Size(88, 48)),
-                onPressed: () => _open(context, const BlePage()),
-                icon: const Icon(Icons.bluetooth_searching),
-                label: const Text('Connect a device'),
-              ),
+            const SizedBox(height: 12),
+            PrimaryButton(
+              label: 'Connect a device',
+              onPressed: () => _open(context, const BlePage()),
+              icon: Icons.bluetooth_searching,
             ),
           ],
         ],
@@ -1088,6 +1112,7 @@ class _BlePageState extends ConsumerState<BlePage> {
   StreamSubscription<List<ScanResult>>? sub;
   List<ScanResult> devices = [];
   bool scanning = false;
+  String? _scanError;
   // Drives the retry countdown so a backoff wait always shows something moving.
   Timer? _ticker;
 
@@ -1097,6 +1122,9 @@ class _BlePageState extends ConsumerState<BlePage> {
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted && ref.read(bleProvider).retryAt != null) setState(() {});
     });
+    // Scan starts as soon as this screen opens -- "Connect a device" is the single entry point
+    // now, so it should not take an extra tap on top of navigating here to see any results.
+    WidgetsBinding.instance.addPostFrameCallback((_) => scan());
   }
 
   @override
@@ -1106,17 +1134,52 @@ class _BlePageState extends ConsumerState<BlePage> {
     super.dispose();
   }
 
+  /// Android gates BLE scan results behind runtime permissions the manifest alone doesn't grant:
+  /// BLUETOOTH_SCAN on API 31+, and ACCESS_FINE_LOCATION on older Android (without it, `startScan`
+  /// either throws or silently returns zero results even though it looks like it's "scanning").
+  /// Requesting both keeps every supported OS version covered without branching on SDK level.
+  Future<bool> _ensureScanPermission() async {
+    if (!Platform.isAndroid) return true;
+    final statuses = await [Permission.bluetoothScan, Permission.locationWhenInUse].request();
+    if (statuses.values.every((s) => s.isGranted)) return true;
+    setState(() => _scanError =
+        'MEDILINK needs Bluetooth and location permission to scan for nearby devices. Grant them in Settings, then try again.');
+    return false;
+  }
+
   Future<void> scan() async {
     setState(() {
       scanning = true;
       devices = [];
+      _scanError = null;
     });
-    sub = FlutterBluePlus.scanResults.listen((v) {
-      if (mounted) setState(() => devices = v);
-    });
-    await FlutterBluePlus.startScan(timeout: _scanDuration);
-    await Future<void>.delayed(_scanDuration);
-    if (mounted) setState(() => scanning = false);
+    try {
+      if (!await _ensureScanPermission()) return;
+      if (Platform.isAndroid || Platform.isIOS) {
+        final adapterState = await FlutterBluePlus.adapterState.first;
+        if (adapterState != BluetoothAdapterState.on) {
+          setState(() => _scanError = 'Bluetooth is off. Turn Bluetooth on, then scan again.');
+          return;
+        }
+      }
+      await sub?.cancel();
+      sub = FlutterBluePlus.scanResults.listen(
+        (v) {
+          if (mounted) setState(() => devices = v);
+        },
+        onError: (_) {
+          if (mounted) setState(() => _scanError = 'Scanning failed. Check Bluetooth is on and try again.');
+        },
+      );
+      await FlutterBluePlus.startScan(timeout: _scanDuration);
+      await Future<void>.delayed(_scanDuration);
+    } catch (_) {
+      if (mounted) setState(() => _scanError = 'Could not scan for devices. Check Bluetooth is on and try again.');
+    } finally {
+      // Guaranteed even on a thrown permission/adapter/scan error -- without this in a `finally`,
+      // any exception above left the UI stuck on the scanning spinner forever with no way out.
+      if (mounted) setState(() => scanning = false);
+    }
   }
 
   /// The MEDILINK wearable first, then everything that at least told us its name, then the
@@ -1159,8 +1222,10 @@ class _BlePageState extends ConsumerState<BlePage> {
                       child: LoadingState(label: 'Looking for nearby devices...'),
                     ),
                   )
+                : _scanError != null
+                ? ErrorState(message: _scanError!, onRetry: scan)
                 : const EmptyState(
-                    title: 'No nearby devices',
+                    title: 'No nearby devices found',
                     detail: 'Turn on Bluetooth, make sure your wearable is switched on, then scan again.',
                     icon: Icons.bluetooth_disabled,
                   ),
@@ -1391,6 +1456,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
   int? _consecutiveNormalReadings;
   int? _autoResolveThreshold;
   DateTime? _resolvedAt;
+  String? _resolutionNotes;
   int? _cooldownSeconds;
   Timer? _cooldownTicker;
   RealtimeConnection? _connection;
@@ -1402,6 +1468,10 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
   // connection) out from under the escalation, breaking both navigation and the caretaker relay.
   String? _sosEmergencyId;
   String? get _activeId => widget.emergencyId ?? _sosEmergencyId;
+  // amends/51-52: captured as early as possible (the whole ~30s countdown window, not only at
+  // the exact moment "Need Help" is tapped) so a no-response TIMEOUT also has real coordinates
+  // to send, not just an explicit confirm.
+  Map<String, double>? _capturedLocation;
 
   @override
   void initState() {
@@ -1414,6 +1484,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       hapticTimer = Timer.periodic(const Duration(milliseconds: 900), (_) => HapticFeedback.heavyImpact());
       HapticFeedback.heavyImpact();
       _subscribeRealtime();
+      unawaited(_captureLocationEarly());
     }
     ref.read(apiClientProvider).systemStatus().then((status) {
       if (mounted) setState(() => callProviderMode = status['callProviderMode']?.toString());
@@ -1447,6 +1518,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       _cooldownSeconds = (data['cooldownSeconds'] as num?)?.toInt();
       final resolvedAtRaw = data['resolvedAt']?.toString();
       _resolvedAt = (resolvedAtRaw != null && resolvedAtRaw.isNotEmpty) ? DateTime.tryParse(resolvedAtRaw) : null;
+      _resolutionNotes = data['resolutionNotes']?.toString();
       if (status != null) {
         emergencyStatus = status;
         resolved = status != 'VERIFICATION';
@@ -1579,6 +1651,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       _autoResolveThreshold = null;
       _resolvedAt = null;
       _cooldownSeconds = null;
+      _capturedLocation = null;
     });
   }
 
@@ -1603,10 +1676,12 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
           _autoResolveThreshold = null;
           _resolvedAt = null;
           _cooldownSeconds = null;
+          _capturedLocation = null;
         });
         hapticTimer?.cancel();
         hapticTimer = Timer.periodic(const Duration(milliseconds: 900), (_) => HapticFeedback.heavyImpact());
         _subscribeRealtime();
+        unawaited(_captureLocationEarly());
         await _loadCountdownAndStart();
       }
     } on ApiException catch (e) {
@@ -1617,6 +1692,51 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
     } finally {
       if (mounted) setState(() => sosSending = false);
     }
+  }
+
+  /// Patient-facing fallback for an emergency stuck past VERIFICATION (CONFIRMED/ACKNOWLEDGED/
+  /// RESPONDING/HOSPITAL_ESCALATED) -- auto-resolve only fires from consecutive NORMAL vitals
+  /// readings, which may never arrive. Without this, "Back to home" only cleared local widget
+  /// state while the backend emergency stayed open, so the next SOS tap always hit a 409
+  /// "Emergency already active" until the app was restarted.
+  Future<void> _endEmergency() async {
+    if (_activeId == null || busy) return;
+    setState(() => busy = true);
+    try {
+      final response = await ref.read(apiClientProvider).resolveEmergency(_activeId!, notes: "Marked safe by patient");
+      if (mounted) _applyEmergencyData(response);
+    } on ApiException catch (error) {
+      if (mounted) setState(() => message = error.message);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  /// Real device GPS, no mocked/hardcoded coordinates. Returns null (never throws) on denied
+  /// permission, GPS off, or no fix -- callers proceed without coordinates rather than blocking
+  /// or sending a fake location.
+  Future<Map<String, double>?> _tryFreshLocation() async {
+    try {
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) return null;
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      );
+      return {'latitude': position.latitude, 'longitude': position.longitude};
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Fired once, in the background, as soon as the countdown starts -- gives GPS the whole ~30s
+  /// window to get a fix instead of only the instant "Need Help" is tapped, and is the only
+  /// chance a no-response TIMEOUT (nobody taps anything) ever has to include real coordinates.
+  Future<void> _captureLocationEarly() async {
+    final location = await _tryFreshLocation();
+    if (mounted && location != null) _capturedLocation = location;
   }
 
   Future<void> _action(String action) async {
@@ -1630,22 +1750,15 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
         body = {'patientResponse': 'IM_OK', 'reason': 'Patient confirmed safe'};
       } else if (action == 'confirm') {
         body = {'patientResponse': 'NEED_HELP'};
-        // Real device GPS, captured at confirm time -- no mocked/hardcoded coordinates.
-        try {
-          var permission = await Geolocator.checkPermission();
-          if (permission == LocationPermission.denied) {
-            permission = await Geolocator.requestPermission();
-          }
-          if (permission != LocationPermission.denied && permission != LocationPermission.deniedForever) {
-            final position = await Geolocator.getCurrentPosition(
-              locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
-            );
-            body['location'] = {'latitude': position.latitude, 'longitude': position.longitude};
-          }
-        } catch (_) {
-          // Location capture failed (permission denied / GPS off) -- confirm still proceeds
-          // without coordinates rather than sending a fake location.
-        }
+      } else if (action == 'no-response') {
+        body = {};
+      }
+      if (action == 'confirm' || action == 'no-response') {
+        // Prefer whatever the background capture already has (it's had up to the whole
+        // countdown to get a fix) -- only attempt one more fresh, blocking fetch here if nothing
+        // was captured yet, e.g. permission was granted moments ago.
+        final location = _capturedLocation ?? await _tryFreshLocation();
+        if (location != null) body!['location'] = location;
       }
       final response = await ref.read(apiClientProvider).emergencyAction(_activeId!, action, body);
       if (!mounted) return;
@@ -1794,6 +1907,11 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
           "You're marked safe",
           'You confirmed you\'re OK. No caretakers were contacted for this alert.',
         ),
+      'RESOLVED' when _resolutionNotes == 'Marked safe by patient' => (
+          Icons.check_circle,
+          "You're marked safe",
+          'You ended this emergency yourself.',
+        ),
       'RESOLVED' => (
           Icons.check_circle,
           'Vitals back to normal',
@@ -1862,10 +1980,18 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
         ),
       ),
       const SizedBox(height: 12),
-      OutlinedButton(
-        onPressed: _backToHome,
-        child: const Text('Back to home'),
-      ),
+      // Still open on the backend (CONFIRMED/ACKNOWLEDGED/RESPONDING/HOSPITAL_ESCALATED) --
+      // "Back to home" alone won't free up the next SOS, so offer the real close-out action.
+      if (!isSafe)
+        FilledButton(
+          onPressed: busy ? null : _endEmergency,
+          child: Text(busy ? 'Ending emergency...' : "I'm safe now -- end emergency"),
+        )
+      else
+        OutlinedButton(
+          onPressed: _backToHome,
+          child: const Text('Back to home'),
+        ),
     ];
   }
 }

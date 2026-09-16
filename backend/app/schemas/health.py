@@ -30,6 +30,13 @@ class HealthReadingCreate(BaseModel):
     # Patient-reported trigger/situation, where the patient has provided one (Phase 20.3). Absent
     # (not empty string) means "not reported" -- never inferred.
     reportedTrigger: Optional[str] = Field(default=None, max_length=200)
+    # Multi-sensor tier classifier inputs (amends/48e) -- OPTIONAL, absent entirely on a 3-sensor
+    # wearable that only has heart rate/SpO2/motion. Kept snake_case (unlike the camelCase fields
+    # above) to match the sensor names used throughout sensor_schema.json, the dataset generator,
+    # and the trained model's feature columns one-to-one, with no renaming step at the boundary.
+    eda_gsr_level: Optional[float] = Field(default=None, ge=0, le=40)
+    skin_temp_c: Optional[float] = Field(default=None, ge=25, le=40)
+    prv_ms: Optional[float] = Field(default=None, ge=0, le=200)
 
 
 class RiskResult(BaseModel):
@@ -44,6 +51,12 @@ class RiskResult(BaseModel):
     panicPatternDetected: bool = False
     panicAttackType: PanicAttackType = PanicAttackType.NONE_DETECTED
     motionDetected: Optional[bool] = None
+    # tier_classifier_v3's normal/false_alarm/real_panic call for THIS reading, recomputed fresh on
+    # every single reading (amends/49) -- distinct from Emergency.tierCategory, which is stamped
+    # ONCE at emergency creation and stays locked while that emergency is open (intentional product
+    # behavior: an open emergency's tier decision must not flip mid-flow). Score model accuracy
+    # against THIS field, never against tierCategory.
+    tierPrediction: Optional[str] = None
 
 
 class HealthReadingOut(HealthReadingCreate):

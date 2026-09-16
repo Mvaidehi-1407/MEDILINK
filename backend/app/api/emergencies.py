@@ -3,7 +3,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.dependencies import assert_owner_or_roles, db, get_current_user
 from app.models.enums import UserRole
-from app.schemas.emergency import CommResultRequest, EmergencyCancelRequest, EmergencyConfirmRequest, EmergencyCreate, EmergencyResolveRequest
+from app.schemas.emergency import CommResultRequest, EmergencyCancelRequest, EmergencyConfirmRequest, EmergencyCreate, EmergencyNoResponseRequest, EmergencyResolveRequest
 from app.services.emergency_service import EmergencyService
 
 
@@ -56,10 +56,18 @@ async def cancel(emergency_id: str, payload: EmergencyCancelRequest, user: dict 
 
 
 @router.post("/{emergency_id}/no-response")
-async def no_response(emergency_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
+async def no_response(
+    emergency_id: str, payload: EmergencyNoResponseRequest = EmergencyNoResponseRequest(),
+    user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db),
+):
+    # amends/51-52: previously dropped any location the app had captured during the countdown --
+    # a no-response (timed-out) emergency's SMS always said "Location: not yet available" even
+    # when the app had a fix ready, purely because this endpoint never accepted one.
     emergency = await EmergencyService(database).get(emergency_id)
     assert_owner_or_roles(emergency["patientId"], user, [UserRole.CAREGIVER])
-    return await EmergencyService(database).confirm(emergency_id, EmergencyConfirmRequest(patientResponse="NO_RESPONSE"))
+    return await EmergencyService(database).confirm(
+        emergency_id, EmergencyConfirmRequest(patientResponse="NO_RESPONSE", location=payload.location),
+    )
 
 
 @router.post("/{emergency_id}/acknowledge-contact")
@@ -95,6 +103,10 @@ async def respond(emergency_id: str, user: dict = Depends(get_current_user), dat
 
 @router.post("/{emergency_id}/resolve")
 async def resolve(emergency_id: str, payload: EmergencyResolveRequest, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
-    if user["role"] != UserRole.HOSPITAL.value:
-        raise HTTPException(status_code=403, detail="Only hospital accounts can resolve emergencies")
+    # Hospital staff resolve on the patient's behalf, but the patient themself must also be able
+    # to end their own emergency (e.g. "I'm safe now" after the caretaker call) -- otherwise an
+    # emergency past VERIFICATION (CONFIRMED/ACKNOWLEDGED/RESPONDING) stays open forever with no
+    # patient-facing way to close it, permanently blocking every future SOS with a 409.
+    emergency = await EmergencyService(database).get(emergency_id)
+    assert_owner_or_roles(emergency["patientId"], user, [UserRole.HOSPITAL])
     return await EmergencyService(database).resolve(emergency_id, payload.resolutionNotes)

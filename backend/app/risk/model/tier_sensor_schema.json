@@ -1,0 +1,42 @@
+{
+  "_comment": "Impute defaults for the tier_classifier's OPTIONAL multi-sensor fields (amends/48e). Deliberately a SEPARATE file from sensor_schema.json: that schema drives risk_model_v3.joblib's IsolationForest input vector via missing_aware_preprocessing.reading_to_vector(), which is a FIXED dimensionality (2 numbers per sensor) baked into that model at training time -- adding sensors there would silently change that model's input shape and break it. This file only ever feeds TierClassifierModel.predict(), which builds its input from tier_classifier_v3.joblib's own declared `features` list, so it's free to grow independently. required=true sensors are the original 3-sensor-wearable baseline; required=false are the v5 multi-sensor additions a 3-sensor wearable simply won't have.",
+
+  "sensors": {
+    "heart_rate_bpm": {
+      "min": 30,
+      "max": 220,
+      "impute_default": 75,
+      "required": true
+    },
+    "spo2_percent": {
+      "min": 70,
+      "max": 100,
+      "impute_default": 97,
+      "required": true
+    },
+    "motion_level": {
+      "min": 0,
+      "max": 10,
+      "impute_default": 1,
+      "required": true
+    },
+    "eda_gsr_level": {
+      "min": 0,
+      "max": 40,
+      "impute_default": 2.5,
+      "required": false
+    },
+    "skin_temp_c": {
+      "min": 25,
+      "max": 40,
+      "impute_default": 34.0,
+      "required": false
+    },
+    "prv_ms": {
+      "min": 0,
+      "max": 200,
+      "impute_default": 55,
+      "required": false
+    }
+  }
+}
