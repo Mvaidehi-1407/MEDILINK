@@ -13,11 +13,9 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../core/api_client.dart';
-import '../core/crash_reporting.dart';
 import '../core/native_comm_service.dart';
 import '../core/realtime_service.dart';
 import '../core/session.dart';
-import '../core/vitals_simulator.dart';
 import '../widgets/common.dart';
 import 'contacts.dart';
 import 'emergency_map.dart';
@@ -63,7 +61,7 @@ class _RoleShellState extends ConsumerState<RoleShell> {
 
   // The native SMS/call bridge must stay live for the entire patient session, not just while the
   // Home tab happens to be visible -- RoleShell swaps `views[index]` in and out of the tree on
-  // every tab change (and pushed routes like the confirmation/simulator screens sit on top of
+  // every tab change (and pushed routes like the confirmation screen sit on top of
   // this same shell), so a listener living inside one tab's widget gets disposed the moment the
   // patient navigates away, silently dropping every escalation.attempt that arrives after that.
   void _ensureEscalationListener(String? role, String patientId) {
@@ -394,10 +392,6 @@ class HealthStatusCard extends ConsumerWidget {
                       style: TextStyle(fontWeight: FontWeight.w800),
                     ),
                   ),
-                  if (data?['source'] == 'DEMO') ...[
-                    const DevSimulatedBadge(),
-                    const SizedBox(width: 8),
-                  ],
                   StatusBadge(
                     label: risk?['riskLevel']?.toString() ?? 'STABLE',
                   ),
@@ -428,27 +422,6 @@ class HealthStatusCard extends ConsumerWidget {
   }
 }
 
-class DevSimulatedBadge extends StatelessWidget {
-  const DevSimulatedBadge({super.key});
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-    decoration: BoxDecoration(
-      color: MedilinkColors.amber.withValues(alpha: .15),
-      borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: MedilinkColors.amber.withValues(alpha: .4)),
-    ),
-    child: const Text(
-      'DEV/SIMULATED',
-      style: TextStyle(
-        color: MedilinkColors.amber,
-        fontWeight: FontWeight.w800,
-        fontSize: 10,
-      ),
-    ),
-  );
-}
-
 class AiInsightCard extends StatelessWidget {
   const AiInsightCard({super.key, required this.reading});
   final AsyncValue<Map<String, dynamic>?> reading;
@@ -463,21 +436,13 @@ class AiInsightCard extends StatelessWidget {
         final risk = data?['risk'] as Map?;
         final recommendation = risk?['recommendation']?.toString();
         final engineUsed = risk?['engineUsed']?.toString();
-        final isSimulated = data?['source'] == 'DEMO';
         return SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                children: [
-                  const Expanded(
-                    child: Text(
-                      'AI insight',
-                      style: TextStyle(fontWeight: FontWeight.w800),
-                    ),
-                  ),
-                  if (isSimulated) const DevSimulatedBadge(),
-                ],
+              const Text(
+                'AI insight',
+                style: TextStyle(fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               Text(
@@ -507,7 +472,6 @@ class HealthPage extends ConsumerWidget {
   const HealthPage({super.key});
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final devModeEnabled = ref.watch(sessionProvider).devModeEnabled;
     return PageFrame(
       title: 'Health',
       child: ListView(
@@ -535,157 +499,9 @@ class HealthPage extends ConsumerWidget {
             onPressed: () => _open(context, const BlePage()),
             icon: Icons.bluetooth_outlined,
           ),
-          if (devModeEnabled) ...[
-            const SizedBox(height: 10),
-            OutlinedButton.icon(
-              onPressed: () => _open(context, const SimulatorPage()),
-              icon: const Icon(Icons.science_outlined),
-              label: const Text('Open development simulator (Dev Mode)'),
-            ),
-          ],
         ],
       ),
     );
-  }
-}
-
-class SimulatorPage extends ConsumerStatefulWidget {
-  const SimulatorPage({super.key});
-  @override
-  ConsumerState<SimulatorPage> createState() => _SimulatorPageState();
-}
-
-class _SimulatorPageState extends ConsumerState<SimulatorPage> {
-  final _engine = VitalsSimulatorEngine();
-  SimulatedVitals? preview;
-  bool sending = false;
-  bool streaming = false;
-  Timer? _streamTimer;
-  String? result;
-  // Guards against the periodic stream timer firing a new send while a confirmation page is
-  // already open for this emergency -- without this every subsequent 5s tick (still returning
-  // the same open emergency from the backend) would push a duplicate EmergencyPage on top.
-  String? _shownEmergencyId;
-
-  @override
-  void initState() {
-    super.initState();
-    setState(() => preview = _engine.next());
-  }
-
-  @override
-  void dispose() {
-    _streamTimer?.cancel();
-    super.dispose();
-  }
-
-  void _toggleStreaming(bool value) {
-    setState(() => streaming = value);
-    if (value) {
-      _streamTimer = Timer.periodic(const Duration(seconds: 5), (_) => _send());
-    } else {
-      _streamTimer?.cancel();
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final v = preview;
-    return PageFrame(
-      title: 'Health simulator',
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const DevSimulatedBadge(),
-            const SizedBox(height: 16),
-            const Text(
-              'Development-only readings with realistic natural variation and occasional threshold-breaching '
-              'spikes are submitted through the exact same /api/health pipeline a real BLE reading would use.',
-            ),
-            const SizedBox(height: 20),
-            if (v != null) ...[
-              Text(
-                'HR ${v.heartRate} | SpO2 ${v.spo2}% | BP ${v.systolicBP}/${v.diastolicBP} | Temp ${v.temperature}C',
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Generator regime: ${v.regime}',
-                style: const TextStyle(color: Colors.blueGrey),
-              ),
-            ],
-            const SizedBox(height: 16),
-            OutlinedButton.icon(
-              onPressed: streaming ? null : () => setState(() => preview = _engine.next()),
-              icon: const Icon(Icons.refresh),
-              label: const Text('Generate new reading'),
-            ),
-            const SizedBox(height: 16),
-            SwitchListTile(
-              value: streaming,
-              onChanged: _toggleStreaming,
-              title: const Text('Auto-stream every 5s'),
-              subtitle: const Text('Mimics a continuously connected wearable pushing readings.'),
-            ),
-            if (result != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(result!),
-              ),
-            const Spacer(),
-            PrimaryButton(
-              label: streaming ? 'Streaming to monitoring pipeline...' : 'Submit to monitoring pipeline',
-              loading: sending,
-              onPressed: streaming ? null : _send,
-              icon: Icons.send_outlined,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _send() async {
-    // Don't fire a new reading while the previous one is still in flight, or while the
-    // confirmation page is already open for an emergency this loop just created.
-    if (sending || _shownEmergencyId != null) return;
-    final v = preview ?? _engine.next();
-    setState(() {
-      sending = true;
-      result = null;
-    });
-    try {
-      final r = await ref.read(apiClientProvider).submitReading({
-        'patientId': ref.read(sessionProvider).userId,
-        'heartRate': v.heartRate,
-        'spo2': v.spo2,
-        'systolicBP': v.systolicBP,
-        'diastolicBP': v.diastolicBP,
-        'temperature': v.temperature,
-        'deviceId': 'development-simulator',
-        'source': 'DEMO',
-      });
-      final reading = r['reading'] as Map;
-      final emergency = r['emergency'] as Map?;
-      if (!mounted) return;
-      setState(() {
-        result =
-            'Backend accepted reading. Risk: ${(reading['risk'] as Map?)?['riskLevel'] ?? 'UNKNOWN'}${r['emergency'] == null ? '' : '. Emergency verification started.'}';
-        preview = _engine.next();
-      });
-      if (emergency != null && mounted) {
-        final emergencyId = emergency['id'].toString();
-        _shownEmergencyId = emergencyId;
-        await Navigator.of(context).push(MaterialPageRoute(builder: (_) => EmergencyPage(emergencyId: emergencyId)));
-        _shownEmergencyId = null;
-      }
-    } on ApiException catch (e) {
-      if (mounted) setState(() => result = e.message);
-    } finally {
-      if (mounted) setState(() => sending = false);
-    }
   }
 }
 
@@ -834,8 +650,8 @@ class BleController extends Notifier<BleState> {
   static const _reconnectAttempts = 6;
   static const _initialBackoff = Duration(seconds: 2);
   static const _maxBackoff = Duration(seconds: 32);
-  // A wearable can notify several times a second; the monitoring pipeline is fed at the same
-  // cadence as the simulator instead of once per notification.
+  // A wearable can notify several times a second; the monitoring pipeline is fed at a fixed
+  // cadence instead of once per notification.
   static const _minSubmitInterval = Duration(seconds: 5);
   static const _maxFrameBytes = 4096;
 
@@ -1033,8 +849,8 @@ class BleController extends Notifier<BleState> {
     if (_frameBuffer.length > _maxFrameBytes) _frameBuffer.clear();
   }
 
-  /// Readings go through the same `/health/readings` submission the simulator uses -- identical
-  /// body shape, labelled `source: BLE` instead of `DEMO`.
+  /// Readings are submitted through the real `/health/readings` endpoint, labelled
+  /// `source: BLE` so they're attributed to this wearable.
   Future<void> _submit(BleVitals vitals) async {
     final now = DateTime.now();
     if (_submitting) return;
@@ -1745,8 +1561,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
     timer?.cancel();
     hapticTimer?.cancel();
     if (widget.emergencyId != null) {
-      // Opened as a pushed route for a specific emergency (e.g. from the dev vitals simulator) --
-      // there's a real route to pop back to.
+      // Opened as a pushed route for a specific emergency -- there's a real route to pop back to.
       Navigator.of(context).maybePop();
       return;
     }
@@ -2905,27 +2720,6 @@ class ProfilePage extends ConsumerWidget {
               title: const Text('Senior Mode'),
             ),
           ),
-          const SizedBox(height: 16),
-          SectionCard(
-            child: SwitchListTile(
-              value: ref.watch(sessionProvider).devModeEnabled,
-              onChanged: (v) =>
-                  ref.read(sessionProvider.notifier).setDevMode(v),
-              title: const Text('Dev Mode'),
-              subtitle: const Text(
-                'Reveals the vitals simulator for testing. Simulated readings are always labeled DEV/SIMULATED and never replace real BLE data.',
-              ),
-            ),
-          ),
-          if (ref.watch(sessionProvider).devModeEnabled) ...[
-            const SizedBox(height: 16),
-            OutlinedButton.icon(
-              style: OutlinedButton.styleFrom(foregroundColor: MedilinkColors.red),
-              onPressed: () => CrashReporting.forceTestCrash(),
-              icon: const Icon(Icons.bug_report_outlined),
-              label: const Text('Force test crash (Crashlytics)'),
-            ),
-          ],
           const SizedBox(height: 20),
           OutlinedButton.icon(
             onPressed: () async {

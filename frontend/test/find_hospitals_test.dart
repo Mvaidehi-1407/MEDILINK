@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:medilink/features/find_hospitals.dart';
 
@@ -144,6 +146,40 @@ void main() {
       final query = buildOverpassQuery(_centre, 5000);
       expect(query, contains('around:5000,17.385,78.4867'));
       expect(query, contains('out center tags 60;'));
+    });
+  });
+
+  group('fetchNearbyHospitals mirror fallback', () {
+    test('falls through failing mirrors to a later one that answers cleanly', () async {
+      final calledUrls = <String>[];
+      final mock = MockClient((request) async {
+        calledUrls.add(request.url.toString());
+        // The first two mirrors "fail" the way a real overloaded Overpass instance does: a 200
+        // carrying a remark instead of elements, which must not be mistaken for zero hospitals.
+        if (calledUrls.length < 3) {
+          return http.Response('{"remark":"runtime error: Query timed out"}', 200);
+        }
+        return http.Response(jsonEncode({'elements': []}), 200);
+      });
+      final result = await fetchNearbyHospitals(_centre, 5000, client: mock);
+      expect(result, isEmpty);
+      // Stops at the third mirror rather than continuing to try every configured one -- a
+      // mirror that actually answers must end the search immediately.
+      expect(calledUrls, hasLength(3));
+    });
+
+    test('tries every configured mirror, in order, before giving up', () async {
+      final calledUrls = <String>[];
+      final mock = MockClient((request) async {
+        calledUrls.add(request.url.toString());
+        return http.Response('', 503);
+      });
+      // Connectivity checking hits a real platform channel that isn't wired up in a plain unit
+      // test, so only the retry loop itself (which runs entirely before that check) is asserted
+      // here; whatever exception surfaces afterwards is not the point of this test.
+      await fetchNearbyHospitals(_centre, 5000, client: mock).catchError((_) => const <Hospital>[]);
+      expect(calledUrls, hasLength(4));
+      expect(calledUrls.toSet(), hasLength(4)); // four distinct hosts, never the same one twice
     });
   });
 

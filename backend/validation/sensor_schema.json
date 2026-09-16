@@ -1,0 +1,24 @@
+{
+  "_comment": "Fixed superset of every possible sensor MediLink might ever have. Add a new sensor here FIRST, before touching any script. required=true means the field is core enough that it should basically never be missing (used mainly for validation warnings, not to block processing). impute_default is used ONLY when a sensor is genuinely absent for a reading.",
+
+  "sensors": {
+    "heart_rate_bpm": {
+      "min": 30,
+      "max": 220,
+      "impute_default": 75,
+      "required": true
+    },
+    "spo2_percent": {
+      "min": 70,
+      "max": 100,
+      "impute_default": 97,
+      "required": true
+    },
+    "motion_level": {
+      "min": 0,
+      "max": 10,
+      "impute_default": 1,
+      "required": true
+    }
+  }
+}

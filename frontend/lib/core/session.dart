@@ -11,16 +11,12 @@ class AppSession {
     this.refreshToken,
     this.onboarded = false,
     this.seniorMode = false,
-    this.devModeEnabled = false,
   });
   final Map<String, dynamic>? user;
   final String? accessToken;
   final String? refreshToken;
   final bool onboarded;
   final bool seniorMode;
-  // Dev Mode gates the vitals simulator. Off by default, never auto-enabled — it must be
-  // explicitly turned on per install so simulated data is never mistaken for real BLE readings.
-  final bool devModeEnabled;
   bool get signedIn => user != null && accessToken != null;
   String get role => user?['role']?.toString() ?? '';
   String get userId => user?['id']?.toString() ?? '';
@@ -30,7 +26,6 @@ class AppSession {
     String? refreshToken,
     bool? onboarded,
     bool? seniorMode,
-    bool? devModeEnabled,
     bool clearUser = false,
   }) => AppSession(
     user: clearUser ? null : user ?? this.user,
@@ -38,7 +33,6 @@ class AppSession {
     refreshToken: clearUser ? null : refreshToken ?? this.refreshToken,
     onboarded: onboarded ?? this.onboarded,
     seniorMode: seniorMode ?? this.seniorMode,
-    devModeEnabled: devModeEnabled ?? this.devModeEnabled,
   );
 }
 
@@ -61,6 +55,9 @@ class SessionController extends Notifier<AppSession> {
     final access = await _storage.read(key: 'medilink_access');
     final refresh = await _storage.read(key: 'medilink_refresh');
     apiBaseUrl = _preferences?.getString('medilink_api_url');
+    // Dev Mode/the vitals simulator no longer exist -- purge any leftover flag from an install
+    // that had it enabled before, so it never lingers as dead persisted state.
+    await _preferences?.remove('medilink_dev_mode');
     state = AppSession(
       user: rawUser == null
           ? null
@@ -69,7 +66,6 @@ class SessionController extends Notifier<AppSession> {
       refreshToken: refresh,
       onboarded: _preferences?.getBool('medilink_onboarded') ?? false,
       seniorMode: _preferences?.getBool('medilink_senior_mode') ?? false,
-      devModeEnabled: _preferences?.getBool('medilink_dev_mode') ?? false,
     );
   }
 
@@ -108,12 +104,6 @@ class SessionController extends Notifier<AppSession> {
     _preferences ??= await SharedPreferences.getInstance();
     await _preferences!.setBool('medilink_senior_mode', value);
     state = state.copyWith(seniorMode: value);
-  }
-
-  Future<void> setDevMode(bool value) async {
-    _preferences ??= await SharedPreferences.getInstance();
-    await _preferences!.setBool('medilink_dev_mode', value);
-    state = state.copyWith(devModeEnabled: value);
   }
 
   Future<void> clear() async {

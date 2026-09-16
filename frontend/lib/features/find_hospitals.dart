@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
@@ -22,28 +23,44 @@ import 'dashboard.dart' show PageFrame;
 /// This file is standalone: it does not touch the emergency/escalation or calling paths. It only
 /// reuses the same GPS/permission pattern the emergency dispatch confirm step already uses.
 
-/// Public Overpass endpoints, tried in order. The retry after a failure deliberately switches
-/// hosts -- overpass-api.de's usual failure mode is rate-limiting or a queued slot, and an
-/// immediate retry against the same host fails the same way.
+/// Public Overpass endpoints, tried in sequence until one answers. Every retry deliberately
+/// switches hosts -- a public mirror's usual failure mode is rate-limiting or a queued slot, and
+/// an immediate retry against the same host fails the same way. Four mirrors (rather than the
+/// previous two) exist because on-device reports showed even a previously-healthy mirror
+/// (`overpass.private.coffee`) can itself time out under load -- one fallback was not always
+/// enough headroom.
 ///
-/// Mirror health was measured before picking these, and it matters: the obvious mirror
-/// (overpass.kumi.systems) is currently dead, returning 504 after 33s, and overpass.osm.jp does
-/// not resolve at all. Both were rejected. private.coffee answers the app's own query in ~1.8s,
-/// matching the primary.
+/// Mirror health was re-measured before adding to this list, and it matters -- see
+/// `amends/05-hospital-search-reliability-fix.md` for the actual timings:
+/// - `overpass-api.de` -- primary, consistently fastest (well under 1s to ~3s observed).
+/// - `overpass.private.coffee` -- kept as the first fallback; usually ~2-3s, but has been
+///   observed to time out, which is exactly why a *chain* of mirrors is needed, not just one.
+/// - `overpass.kumi.systems` -- flaky (sometimes ~5s, sometimes times out entirely) but free and
+///   occasionally the one that answers when the two above don't, so it stays in the chain with a
+///   short per-attempt timeout rather than being trusted early.
+/// - `maps.mail.ru/osm/tools/overpass` -- slowest of the four (observed 2-7s) but the most
+///   consistently reachable in testing, kept as the last resort before giving up.
+///
+/// `overpass.openstreetmap.ru` (suggested as an example mirror) and `overpass.osm.jp` were both
+/// measured and rejected: neither resolves/responds at all (connection failure on every attempt).
 const _overpassEndpoints = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.private.coffee/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
-/// Top of the 8-10s budget. Every second here is a second a stressed user spends watching a
-/// skeleton, but too tight a deadline turns a merely slow answer into a false error -- and on
-/// mobile data the TLS handshake alone can eat a second before the query starts.
-const _overpassTimeout = Duration(seconds: 10);
+/// Per-mirror budget. Deliberately short -- with up to four mirrors to try in sequence, a 10s
+/// timeout per attempt (the old single-fallback budget) would let a total search run for up to
+/// 40s before giving up, which reads as a hung screen no matter how lively the skeleton looks.
+/// 6s comfortably covers every healthy response observed (well under 3s) while still cutting a
+/// hanging mirror short quickly enough to fall through to the next one.
+const _overpassTimeout = Duration(seconds: 6);
 
 /// What Overpass itself is told it may spend. Deliberately a little under the client deadline so
 /// the server gives up first and returns a real error, rather than the client walking away from a
 /// query the server is still running.
-const _overpassServerBudgetSeconds = 8;
+const _overpassServerBudgetSeconds = 5;
 
 /// Search radii, in metres. The empty state walks the user up this ladder one step at a time.
 const _radiusLadder = [5000, 10000, 25000, 50000];
@@ -134,6 +151,13 @@ Future<LocationFix> resolveLocationFix() async {
 String buildOverpassQuery(LatLng centre, int radiusMetres) {
   final lat = centre.latitude;
   final lng = centre.longitude;
+  // Debug builds only -- a wrong or stale GPS fix silently centres the whole search on the wrong
+  // neighbourhood, and that bug looks identical to "Overpass didn't answer" from the outside.
+  // This never runs in a release build, so it can't leak a patient's coordinates into production
+  // logs.
+  if (kDebugMode) {
+    debugPrint('Find My Hospital: querying Overpass at lat=$lat lng=$lng radius=${radiusMetres}m');
+  }
   final around = '$radiusMetres,$lat,$lng';
   // Ways and relations carry no coordinates of their own, so `out center` is what makes a mapped
   // hospital *building* usable as a point. Both amenity=hospital and healthcare=hospital are
@@ -253,9 +277,12 @@ List<Hospital> dedupeHospitals(List<Hospital> sorted) {
   return kept;
 }
 
-/// Fetches hospitals from Overpass with a hard timeout and exactly one retry (against the second
-/// mirror). Failures are classified before they leave this function so the UI never has to parse
-/// an exception string to decide what to tell the user.
+/// Fetches hospitals from Overpass, falling through `_overpassEndpoints` in sequence -- primary,
+/// then every fallback mirror in order -- until one answers or all of them have failed. Each
+/// attempt gets its own short `_overpassTimeout` rather than one attempt getting the whole
+/// budget, so a single hanging mirror can't consume the entire search. Failures are classified
+/// before they leave this function so the UI never has to parse an exception string to decide
+/// what to tell the user.
 Future<List<Hospital>> fetchNearbyHospitals(
   LatLng centre,
   int radiusMetres, {
@@ -265,19 +292,16 @@ Future<List<Hospital>> fetchNearbyHospitals(
   final query = buildOverpassQuery(centre, radiusMetres);
   Object? lastError;
   try {
-    for (var attempt = 0; attempt < 2; attempt++) {
+    for (final endpoint in _overpassEndpoints) {
       try {
         final response = await httpClient
-            .post(
-              Uri.parse(_overpassEndpoints[attempt % _overpassEndpoints.length]),
-              body: {'data': query},
-            )
+            .post(Uri.parse(endpoint), body: {'data': query})
             .timeout(_overpassTimeout);
         if (response.statusCode == 200) {
           // Overpass reports its *own* failures (rate limit, server-side timeout, out of memory)
           // as HTTP 200 with a `remark` and no elements. Parsing that as "zero hospitals" would
           // send the user to the empty state, telling them to widen a search that never ran --
-          // so a remark is treated as a server failure and retried on the other host.
+          // so a remark is treated as a server failure and retried on the next mirror.
           final remark = overpassRemark(response.body);
           if (remark == null) return parseOverpass(response.body, centre);
           lastError = HttpException('Overpass remark: $remark');
