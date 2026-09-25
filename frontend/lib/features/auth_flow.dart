@@ -453,12 +453,35 @@ class _PermissionsPageState extends State<PermissionsPage> {
   // for an already-set-up user while still reliably prompting a fresh install.
   bool _checkedInitialSkip = false;
 
+  // amends/58: previously only Bluetooth-scan, location, and notifications were requested here --
+  // BLUETOOTH_CONNECT (needed for the actual BLE data connection, not just scanning), phone
+  // (CALL_PHONE, for the automatic emergency call), and SMS (SEND_SMS, for the automatic
+  // emergency text) were only ever requested reactively, the first time a real relayed call/SMS
+  // attempt fired -- exactly the "fails later at an unpredictable point" scenario a live
+  // emergency must never hit. All 6 are now requested upfront, before Home is reachable.
+  static const _requiredPermissions = [
+    Permission.bluetoothScan,
+    Permission.bluetoothConnect,
+    Permission.location,
+    Permission.phone,
+    Permission.sms,
+    Permission.notification,
+  ];
+  final Map<Permission, bool> _grantedState = {};
+
+  bool get _allGranted =>
+      _grantedState.length == _requiredPermissions.length && _grantedState.values.every((g) => g);
+
+  void _onTileStatus(List<Permission> permissions, bool granted) {
+    setState(() {
+      for (final p in permissions) {
+        _grantedState[p] = granted;
+      }
+    });
+  }
+
   Future<void> _maybeAutoSkip() async {
-    final granted = await Future.wait([
-      Permission.bluetoothScan.isGranted,
-      Permission.location.isGranted,
-      Permission.notification.isGranted,
-    ]);
+    final granted = await Future.wait(_requiredPermissions.map((p) => p.isGranted));
     if (mounted && granted.every((g) => g)) {
       context.go('/app');
     } else if (mounted) {
@@ -491,37 +514,58 @@ class _PermissionsPageState extends State<PermissionsPage> {
             ),
             const SizedBox(height: 12),
             const Text(
-              'MEDILINK uses Bluetooth, location, and notifications only for connected care.',
+              'MEDILINK needs every permission below before it can monitor you safely -- '
+              'each one is used only for real emergency response, never anything else.',
             ),
             const SizedBox(height: 24),
-            const Expanded(
-              child: Column(
+            Expanded(
+              child: ListView(
                 children: [
                   PermissionTile(
                     icon: Icons.bluetooth_outlined,
                     title: 'Bluetooth',
                     explanation: 'Needed to connect to your wearable device.',
-                    permission: Permission.bluetoothScan,
+                    permissions: const [Permission.bluetoothScan, Permission.bluetoothConnect],
+                    onStatusChanged: (g) => _onTileStatus(const [Permission.bluetoothScan, Permission.bluetoothConnect], g),
                   ),
                   PermissionTile(
                     icon: Icons.location_on_outlined,
                     title: 'Location',
                     explanation:
-                        'Used only during a real emergency, to tell your caretakers and the nearest hospital where you are.',
-                    permission: Permission.location,
+                        'Used during a real emergency, to tell your caretakers and the nearest hospital where you are.',
+                    permissions: const [Permission.location],
+                    onStatusChanged: (g) => _onTileStatus(const [Permission.location], g),
+                  ),
+                  PermissionTile(
+                    icon: Icons.call_outlined,
+                    title: 'Phone calls',
+                    explanation: 'Needed so your phone can automatically call your caretakers in a confirmed emergency.',
+                    permissions: const [Permission.phone],
+                    onStatusChanged: (g) => _onTileStatus(const [Permission.phone], g),
+                  ),
+                  PermissionTile(
+                    icon: Icons.sms_outlined,
+                    title: 'SMS',
+                    explanation: 'Needed so your phone can automatically text your caretakers in a confirmed emergency.',
+                    permissions: const [Permission.sms],
+                    onStatusChanged: (g) => _onTileStatus(const [Permission.sms], g),
                   ),
                   PermissionTile(
                     icon: Icons.notifications_outlined,
                     title: 'Notifications',
                     explanation: 'Alerts you and your care team the moment something needs attention.',
-                    permission: Permission.notification,
+                    permissions: const [Permission.notification],
+                    onStatusChanged: (g) => _onTileStatus(const [Permission.notification], g),
                   ),
                 ],
               ),
             ),
+            // amends/58: previously this always continued regardless of what was granted --
+            // a denied permission failed silently later, at the exact moment of a real
+            // emergency. Now disabled until every permission above is actually granted.
             PrimaryButton(
-              label: 'Continue to MEDILINK',
-              onPressed: () => context.go('/app'),
+              label: _allGranted ? 'Continue to MEDILINK' : 'Grant all permissions to continue',
+              onPressed: _allGranted ? () => context.go('/app') : null,
               icon: Icons.arrow_forward,
             ),
           ],
@@ -537,39 +581,50 @@ class PermissionTile extends StatefulWidget {
     required this.icon,
     required this.title,
     required this.explanation,
-    required this.permission,
+    required this.permissions,
+    this.onStatusChanged,
   });
   final IconData icon;
   final String title;
   final String explanation;
-  final Permission permission;
+  // amends/58: a group of permissions requested and reported together (e.g. Bluetooth scan +
+  // connect are one logical "Bluetooth" row to the user, even though Android treats them as two
+  // separate runtime permissions).
+  final List<Permission> permissions;
+  final ValueChanged<bool>? onStatusChanged;
   @override
   State<PermissionTile> createState() => _PermissionTileState();
 }
 
 class _PermissionTileState extends State<PermissionTile> {
-  PermissionStatus? _status;
+  Map<Permission, PermissionStatus> _statuses = {};
+  bool get _checked => _statuses.length == widget.permissions.length;
+  bool get _allGranted => _checked && _statuses.values.every((s) => s.isGranted);
+
+  Future<void> _refresh(Map<Permission, PermissionStatus> statuses) async {
+    if (!mounted) return;
+    setState(() => _statuses = statuses);
+    widget.onStatusChanged?.call(_allGranted);
+  }
 
   @override
   void initState() {
     super.initState();
-    widget.permission.status.then((s) {
-      if (mounted) setState(() => _status = s);
-    });
+    Future.wait(widget.permissions.map((p) async => MapEntry(p, await p.status)))
+        .then((entries) => _refresh(Map.fromEntries(entries)));
   }
 
   Future<void> _request() async {
-    final result = await widget.permission.request();
-    if (mounted) setState(() => _status = result);
+    _refresh(await widget.permissions.request());
   }
 
   @override
   Widget build(BuildContext context) {
-    final granted = _status?.isGranted ?? false;
+    final granted = _allGranted;
     // Only true after an actual request came back denied -- never shown before the first tap,
     // so a permission nobody has asked about yet doesn't read as "you already said no".
-    final deniedAfterAsking = _status != null && !granted;
-    final permanentlyDenied = _status?.isPermanentlyDenied ?? false;
+    final deniedAfterAsking = _checked && !granted;
+    final permanentlyDenied = _statuses.values.any((s) => s.isPermanentlyDenied);
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: SectionCard(

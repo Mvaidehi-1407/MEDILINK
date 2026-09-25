@@ -30,9 +30,15 @@ class RealtimeConnection with WidgetsBindingObserver {
   WebSocketChannel? _channel;
   StreamSubscription? _subscription;
   Timer? _reconnectTimer;
+  Timer? _pingTimer;
   int _backoffSeconds = 1;
   bool _disposed = false;
   bool _connected = false;
+
+  // No client-initiated traffic means an idle-looking socket, which mobile carrier/Wi-Fi NAT
+  // tables and Android's battery management commonly kill in well under a minute -- the server
+  // already answers a ping with a pong (see app/api/websockets.py), nothing was ever sending one.
+  static const _pingInterval = Duration(seconds: 20);
 
   Stream<Map<String, dynamic>> get events => _controller.stream;
   bool get isConnected => _connected;
@@ -66,6 +72,12 @@ class RealtimeConnection with WidgetsBindingObserver {
       // Auth token travels as the first WS message, never in the URL, so it never lands in
       // proxy/server access logs.
       channel.sink.add(jsonEncode({'type': 'auth', 'token': token}));
+      _pingTimer?.cancel();
+      _pingTimer = Timer.periodic(_pingInterval, (_) {
+        try {
+          channel.sink.add(jsonEncode({'type': 'ping'}));
+        } catch (_) {}
+      });
       _subscription = channel.stream.listen(
         (event) {
           _connected = true;
@@ -73,7 +85,10 @@ class RealtimeConnection with WidgetsBindingObserver {
           if (event is! String) return;
           try {
             final data = Map<String, dynamic>.from(jsonDecode(event) as Map);
-            if (data['event'] == 'auth.ok') return;
+            if (data['event'] == 'pong') return;
+            // auth.ok is forwarded (not swallowed) so listeners can re-check server state on
+            // every fresh connect, not just react to whichever push happens to arrive next --
+            // a push made while this socket was mid-reconnect is otherwise gone for good.
             _controller.add(data);
           } catch (_) {}
         },
@@ -88,6 +103,7 @@ class RealtimeConnection with WidgetsBindingObserver {
 
   void _scheduleReconnect() {
     _connected = false;
+    _pingTimer?.cancel();
     if (_disposed || _reconnectTimer?.isActive == true) return;
     _reconnectTimer = Timer(Duration(seconds: _backoffSeconds), () {
       _backoffSeconds = (_backoffSeconds * 2).clamp(1, 30);
@@ -113,6 +129,7 @@ class RealtimeConnection with WidgetsBindingObserver {
   void dispose() {
     _disposed = true;
     _reconnectTimer?.cancel();
+    _pingTimer?.cancel();
     _subscription?.cancel();
     _channel?.sink.close();
     WidgetsBinding.instance.removeObserver(this);

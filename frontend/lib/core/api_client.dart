@@ -43,6 +43,9 @@ class ApiClient {
     Object? body,
     Map<String, String>? query,
     bool allowRefresh = true,
+    // amends/58: set only by _doRefresh() below, to the refresh token THIS call is using --
+    // lets the 401 handler tell a stale race loss apart from a genuinely dead session (see there).
+    String? refreshTokenUsed,
   }) async {
     final headers = <String, String>{'Content-Type': 'application/json'};
     final token = _session.accessToken;
@@ -61,7 +64,21 @@ class ApiClient {
         final refreshed = await _refreshTokens();
         if (refreshed) return await _request(method, path, body: body, query: query, allowRefresh: false);
       }
-      if (response.statusCode == 401) await _session.clear();
+      if (response.statusCode == 401) {
+        // amends/58: root cause of the token-refresh race -- two WebSocket connections
+        // reconnecting near-simultaneously (see RealtimeConnection) could each call
+        // _refreshTokens(), and although _refreshInFlight coalesces truly concurrent calls on
+        // this same ApiClient instance, a losing /auth/refresh 401 ("already used or revoked")
+        // still unconditionally wiped the session here -- even when a concurrent call had
+        // already WON the race and stored fresher tokens by the time this response arrived.
+        // That losing 401 is stale information about a token that no longer matters, not proof
+        // the (now different) current session is bad -- so only clear when nothing fresher has
+        // since replaced the credential this specific request was sent with.
+        final stillCurrent = refreshTokenUsed != null
+            ? _session.refreshToken == refreshTokenUsed
+            : _session.accessToken == token;
+        if (stillCurrent) await _session.clear();
+      }
       final detail = data is Map && data['detail'] != null
           ? data['detail'].toString()
           : 'Request failed (${response.statusCode})';
@@ -92,7 +109,7 @@ class ApiClient {
     final refresh = _session.refreshToken;
     if (refresh == null) return false;
     try {
-      final data = await _request('POST', '/auth/refresh', body: {'refreshToken': refresh}, allowRefresh: false) as Map;
+      final data = await _request('POST', '/auth/refresh', body: {'refreshToken': refresh}, allowRefresh: false, refreshTokenUsed: refresh) as Map;
       await _session.updateTokens(accessToken: data['accessToken'].toString(), refreshToken: data['refreshToken'].toString());
       return true;
     } on ApiException {

@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     # the permanent block the "fires only once" bug had -- that just absorbs a borderline reading
     # flickering right at the resolve boundary. Disabled (0) by default so an explicit resolve
     # always frees the patient immediately; deployments that want the flap-guard set this >0.
+    # (backend/tests/test_emergency_repeat.py explicitly asserts this default is 0/immediate --
+    # don't change it here. Enable the guard per-deployment via EMERGENCY_COOLDOWN_SECONDS in
+    # backend/.env instead of changing this class default.)
     emergency_cooldown_seconds: int = 0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
