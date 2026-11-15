@@ -26,6 +26,7 @@ import 'emergency_map.dart';
 import 'find_hospitals.dart';
 import 'medical_vault.dart';
 import 'messaging.dart';
+import 'patient_messages.dart';
 import 'patients.dart';
 import 'profile_pages.dart';
 import 'qr_access.dart';
@@ -585,8 +586,12 @@ class _PatientHomeState extends ConsumerState<PatientHome> {
               FeatureTile(
                 title: 'Messages',
                 subtitle: 'Talk to your doctor',
-                leading: const AssetBadge(AppIcons.badgeMessages, size: 56),
-                onTap: () => _open(context, const ChatPage()),
+                leading: Badge(
+                  isLabelVisible: ref.watch(patientUnreadProvider) > 0,
+                  label: Text('${ref.watch(patientUnreadProvider)}'),
+                  child: const AssetBadge(AppIcons.badgeMessages, size: 56),
+                ),
+                onTap: () => _open(context, const PatientMessagesPage()).then((_) => ref.invalidate(patientConversationsProvider)),
               ),
             ],
           ),
@@ -3282,10 +3287,14 @@ class ConnectionsPage extends StatelessWidget {
           child: ListTile(
             leading: const Icon(Icons.chat_bubble_outline),
             title: const Text('Messages'),
-            subtitle: const Text(
-              'Chat with your connected doctors and caregivers',
+            subtitle: const Text('Talk to your doctor'),
+            trailing: Consumer(
+              builder: (_, ref, _) {
+                final unread = ref.watch(patientUnreadProvider);
+                return unread > 0 ? Badge(label: Text('$unread')) : const Icon(Icons.chevron_right);
+              },
             ),
-            onTap: () => _open(context, const ChatPage()),
+            onTap: () => _open(context, const PatientMessagesPage()),
           ),
         ),
       ],
@@ -3734,6 +3743,7 @@ class NotificationsPage extends ConsumerWidget {
           itemCount: s.data!.length,
           itemBuilder: (c, i) => ListTile(
             title: Text(s.data![i]['title']?.toString() ?? 'MEDILINK update'),
+            subtitle: s.data![i]['body'] == null ? null : Text(s.data![i]['body'].toString()),
           ),
         );
       },
