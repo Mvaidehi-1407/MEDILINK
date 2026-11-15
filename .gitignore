@@ -30,3 +30,22 @@ frontend/android/google-services.json
 *.jks
 *.keystore
 
+
+# Part C additions (secrets, build output, uploads, dumps)
+*.pem
+*.key
+key.properties
+google-services.json
+GoogleService-Info.plist
+*service-account*.json
+*serviceAccount*.json
+.flutter-plugins*
+local.properties
+**/android/.gradle/
+**/ios/Pods/
+node_modules/
+backend/storage/
+backend/uploads/
+*.dump
+*.bson
+dump/
