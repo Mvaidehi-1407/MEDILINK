@@ -13,6 +13,7 @@ import '../ui/brand.dart';
 import '../ui/components.dart';
 import '../ui/onboarding.dart';
 import '../widgets/common.dart';
+import 'doctor_portal.dart' show DoctorFieldsController, DoctorProfileFields;
 import 'profile_pages.dart' show ServerSettingsPage;
 
 class OnboardingPage extends ConsumerStatefulWidget {
@@ -203,6 +204,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
   final _care2Phone = TextEditingController();
   final _care3Name = TextEditingController();
   final _care3Phone = TextEditingController();
+  final _doctor = DoctorFieldsController();
   String _role = 'PATIENT';
   bool _loading = false;
   String? _error;
@@ -220,6 +222,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
     _care2Phone.dispose();
     _care3Name.dispose();
     _care3Phone.dispose();
+    _doctor.dispose();
     super.dispose();
   }
 
@@ -305,6 +308,14 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                   _caretakerFields(2, _care2Name, _care2Phone),
                   const SizedBox(height: AppSpacing.sm),
                   _caretakerFields(3, _care3Name, _care3Phone),
+                ],
+                if (_role == 'DOCTOR') ...[
+                  const SizedBox(height: AppSpacing.xxl),
+                  Text('Professional details', style: AppText.title),
+                  const SizedBox(height: AppSpacing.xxs),
+                  Text('Patients see these on your profile. You can change them later.', style: AppText.bodySm),
+                  const SizedBox(height: AppSpacing.md),
+                  DoctorProfileFields(controller: _doctor),
                 ],
               ],
               if (_error != null)
@@ -462,6 +473,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                       {'name': _care3Name.text.trim(), 'phone': _care3Phone.text.trim()},
                     ]
                   : null,
+              doctor: _role == 'DOCTOR' ? _doctor.toJson() : null,
             );
       await ref.read(sessionProvider.notifier).saveAuth(payload);
       unawaited(FcmService(ref.read(apiClientProvider)).initializeAndRegister());

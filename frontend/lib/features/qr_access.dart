@@ -14,6 +14,7 @@ import '../core/api_client.dart';
 import '../core/session.dart';
 import '../theme/tokens.dart';
 import '../ui/fallback.dart';
+import '../ui/format.dart' show parseBackendTime;
 import '../widgets/common.dart';
 import 'dashboard.dart' show PageFrame;
 import 'medical_vault.dart' show AiSummaryView;
@@ -157,7 +158,7 @@ class _QrPageState extends ConsumerState<QrPage> {
     }
   }
 
-  DateTime? get _expiresAt => DateTime.tryParse(_share?['expiresAt']?.toString() ?? '')?.toLocal();
+  DateTime? get _expiresAt => parseBackendTime(_share?['expiresAt']);
 
   String _expiryText() {
     final left = _expiresAt?.difference(DateTime.now());

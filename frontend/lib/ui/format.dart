@@ -12,13 +12,20 @@ String humanizeEnum(Object? value) {
   return words[0].toUpperCase() + words.substring(1);
 }
 
+/// Backend timestamps are UTC but arrive without a zone suffix (Mongo returns naive datetimes);
+/// a string with no `Z`/offset is read as UTC, then converted to the phone's local time.
+DateTime? parseBackendTime(Object? value) {
+  final raw = value?.toString() ?? '';
+  final zoned = raw.isEmpty || RegExp(r'(Z|[+-]\d\d:?\d\d)$').hasMatch(raw) ? raw : '${raw}Z';
+  return DateTime.tryParse(zoned)?.toLocal();
+}
+
 /// ISO-8601 timestamp → "Today, 9:28 AM" / "Yesterday, 9:28 AM" / "4 Nov, 9:28 AM" / "4 Nov 2025, 9:28 AM".
 /// Anything that doesn't parse is returned unchanged.
 String formatTimestamp(Object? value, {DateTime? now}) {
   final raw = value?.toString() ?? '';
-  final parsed = DateTime.tryParse(raw);
-  if (parsed == null) return raw;
-  final t = parsed.isUtc ? parsed.toLocal() : parsed;
+  final t = parseBackendTime(raw);
+  if (t == null) return raw;
   final n = now ?? DateTime.now();
   final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
   final clock = '$h:${t.minute.toString().padLeft(2, '0')} ${t.hour < 12 ? 'AM' : 'PM'}';

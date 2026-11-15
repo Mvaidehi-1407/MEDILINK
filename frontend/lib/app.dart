@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 import 'core/session.dart';
 import 'features/auth_flow.dart';
 import 'features/dashboard.dart';
+import 'features/doctor_portal.dart';
 import 'theme/app_theme.dart';
 import 'theme/tokens.dart';
 import 'ui/components.dart';
@@ -101,6 +102,8 @@ class AuthGate extends ConsumerWidget {
         body: LoadingState(label: 'Securing your MEDILINK session...'),
       );
     }
+    // Doctors get their own shell; every other role keeps RoleShell unchanged.
+    if (ref.watch(sessionProvider).role == 'DOCTOR') return const DoctorShell();
     return const RoleShell();
   }
 }
