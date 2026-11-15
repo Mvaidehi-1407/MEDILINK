@@ -124,6 +124,12 @@ def test_only_owner_or_clinician_role_can_view_patient_reports(client_as, client
     r = stranger.get(f"/api/reports/patient/{patient_id}")
     assert r.status_code == 403
 
-    doctor, _ = client_as("DOCTOR")
+    # Doctor-portal rule: a doctor needs a granted connection with this patient.
+    doctor, doctor_user = client_as("DOCTOR")
+    r = doctor.get(f"/api/reports/patient/{patient_id}")
+    assert r.status_code == 403
+
+    asyncio.new_event_loop().run_until_complete(client_db.consents.insert_one(
+        {"patientId": patient_id, "requesterId": doctor_user["id"], "status": "GRANTED"}))
     r = doctor.get(f"/api/reports/patient/{patient_id}")
     assert r.status_code == 200
