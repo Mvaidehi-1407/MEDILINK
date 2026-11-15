@@ -43,6 +43,14 @@ class RealtimeConnection with WidgetsBindingObserver {
   Stream<Map<String, dynamic>> get events => _controller.stream;
   bool get isConnected => _connected;
 
+  /// Sends a client event (e.g. typing) on the open socket; dropped silently while offline.
+  void send(Map<String, dynamic> message) {
+    if (!_connected) return;
+    try {
+      _channel?.sink.add(jsonEncode(message));
+    } catch (_) {}
+  }
+
   // Mirrors ApiClient's compile-time default exactly -- must stay in sync so the WebSocket and
   // REST API target the same backend. A real device needs this overridden via
   // --dart-define=MEDILINK_API_URL=..., since 10.0.2.2 only resolves on the Android emulator.

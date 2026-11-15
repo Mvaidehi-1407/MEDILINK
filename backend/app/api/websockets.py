@@ -70,7 +70,13 @@ async def conversation_socket(websocket: WebSocket, conversation_id: str):
     if not user:
         await websocket.close(code=4401)
         return
-    if user["id"] not in conversation_id.split(":"):
+    from fastapi import HTTPException
+
+    from app.api.messages import assert_participant
+
+    try:
+        await assert_participant(conversation_id, user, database)
+    except HTTPException:
         await websocket.close(code=4403)
         return
     channel = f"conversation:{conversation_id}"
@@ -81,6 +87,8 @@ async def conversation_socket(websocket: WebSocket, conversation_id: str):
             message = await websocket.receive_json()
             if message.get("type") == "ping":
                 await websocket.send_json({"event": "pong"})
+            elif message.get("type") == "typing":
+                await manager.broadcast(channel, "chat.typing", {"userId": user["id"]})
     except WebSocketDisconnect:
         manager.disconnect(channel, websocket)
 

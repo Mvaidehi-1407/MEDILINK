@@ -135,6 +135,7 @@ class ApiClient {
     required String role,
     required String phone,
     List<Map<String, String>>? caretakers,
+    Map<String, dynamic>? doctor,
   }) async => Map<String, dynamic>.from(
     await post(
       '/auth/register',
@@ -145,6 +146,7 @@ class ApiClient {
         'role': role,
         'phone': phone,
         if (caretakers != null) 'caretakers': caretakers,
+        'doctor': ?doctor,
       },
     ) as Map,
   );
@@ -272,6 +274,42 @@ class ApiClient {
   }
 
   Future<void> deleteMedicalRecord(String recordId) => delete('/medical-records/$recordId');
+
+  /// Doctor chat: sends a PDF/photo into a conversation (server validates type, size, content).
+  Future<Map<String, dynamic>> uploadChatAttachment({
+    required String conversationId,
+    required String clientId,
+    required String filename,
+    required List<int> bytes,
+  }) async {
+    final token = _session.accessToken;
+    final request = http.MultipartRequest('POST', _uri('/messages/attachments'))
+      ..fields['conversationId'] = conversationId
+      ..fields['clientId'] = clientId
+      ..files.add(http.MultipartFile.fromBytes('file', bytes, filename: filename));
+    if (token != null) request.headers['Authorization'] = 'Bearer $token';
+    try {
+      final streamed = await _client.send(request).timeout(const Duration(seconds: 60));
+      final text = await streamed.stream.bytesToString();
+      final data = text.isEmpty ? null : jsonDecode(text);
+      if (streamed.statusCode >= 200 && streamed.statusCode < 300) return Map<String, dynamic>.from(data as Map);
+      final detail = data is Map && data['detail'] != null ? data['detail'].toString() : 'Upload failed (${streamed.statusCode})';
+      throw ApiException(detail, statusCode: streamed.statusCode);
+    } on ApiException {
+      rethrow;
+    } catch (_) {
+      throw ApiException('Unable to reach MEDILINK. Check your connection and try again.');
+    }
+  }
+
+  /// Raw bytes of an authenticated GET (chat attachments).
+  Future<List<int>> getBytes(String path) async {
+    final token = _session.accessToken;
+    final headers = <String, String>{if (token != null) 'Authorization': 'Bearer $token'};
+    final response = await _client.get(_uri(path), headers: headers).timeout(const Duration(seconds: 60));
+    if (response.statusCode >= 200 && response.statusCode < 300) return response.bodyBytes;
+    throw ApiException('Download failed (${response.statusCode})', statusCode: response.statusCode);
+  }
 }
 
 final apiClientProvider = Provider<ApiClient>(
