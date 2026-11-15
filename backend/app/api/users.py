@@ -11,9 +11,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 @router.get("")
 async def list_users(_: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     users = await MongoRepository(database, "users").list(limit=100)
-    for user in users:
-        user.pop("passwordHash", None)
-    return users
+    return [{"id": u["id"], "name": u["name"], "role": u["role"]} for u in users]
 
 
 @router.get("/search")
@@ -29,15 +27,23 @@ async def search_users(
     if role:
         query = {"$and": [query, {"role": role}]}
     users = await MongoRepository(database, "users").list(query, limit=5)
-    for user in users:
-        user.pop("passwordHash", None)
-    return users
+    return [{"id": u["id"], "name": u["name"], "role": u["role"]} for u in users]
 
 
 @router.get("/{user_id}")
-async def get_user(user_id: str, _: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
+async def get_user(user_id: str, me: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     user = await MongoRepository(database, "users").get(user_id)
-    if user:
-        user.pop("passwordHash", None)
-    return user
+    if not user:
+        return None
+    user.pop("passwordHash", None)
+    user.pop("fcmTokens", None)
+    if user_id == me["id"]:
+        return user
+    # Contact details only between connected accounts (granted consent either way) and never a
+    # doctor's own phone/email to patients (public profile rule).
+    linked = await database.consents.find_one({"status": "GRANTED", "$or": [
+        {"patientId": user_id, "requesterId": me["id"]}, {"patientId": me["id"], "requesterId": user_id}]})
+    if linked and user.get("role") != "DOCTOR":
+        return user
+    return {"id": user["id"], "name": user["name"], "role": user["role"]}
 

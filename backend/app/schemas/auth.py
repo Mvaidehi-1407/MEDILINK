@@ -15,6 +15,30 @@ class CaretakerIn(BaseModel):
     phone: str = Field(pattern=_PHONE_PATTERN)
 
 
+SPECIALIZATIONS = {
+    "General Physician", "Cardiologist", "Pulmonologist", "Neurologist", "Endocrinologist", "Pediatrician",
+    "Geriatrician", "Orthopedic", "Dermatologist", "Psychiatrist", "Gynecologist", "Other",
+}
+
+
+class DoctorProfileIn(BaseModel):
+    specialization: str
+    specializationOther: Optional[str] = Field(default=None, max_length=80)
+    qualification: str = Field(min_length=2, max_length=120)
+    experienceYears: int = Field(ge=0, le=70)
+    hospitalName: str = Field(min_length=2, max_length=160)
+    registrationNumber: Optional[str] = Field(default=None, max_length=60)
+    languages: Optional[List[str]] = Field(default=None, max_length=10)
+
+    @model_validator(mode="after")
+    def _check(self) -> "DoctorProfileIn":
+        if self.specialization not in SPECIALIZATIONS:
+            raise ValueError("Choose a specialization from the list")
+        if self.specialization == "Other" and not (self.specializationOther or "").strip():
+            raise ValueError("Enter your specialization")
+        return self
+
+
 class RegisterRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     email: AppEmailStr
@@ -27,12 +51,16 @@ class RegisterRequest(BaseModel):
     # Exactly 3 prioritized emergency caretakers, collected at signup so nobody has to hand-edit
     # the database. Required for PATIENT accounts only.
     caretakers: Optional[List[CaretakerIn]] = None
+    # DOCTOR-only profile fields (all nullable; existing doctors keep working with them empty).
+    doctor: Optional["DoctorProfileIn"] = None
 
     @model_validator(mode="after")
     def _validate_patient_caretakers(self) -> "RegisterRequest":
         if self.role == UserRole.PATIENT:
             if not self.caretakers or len(self.caretakers) != 3:
                 raise ValueError("Exactly 3 emergency caretakers (name + phone) are required for a patient account")
+        if self.role == UserRole.DOCTOR and self.doctor is None:
+            raise ValueError("Specialization, qualification, years of experience and hospital/clinic name are required for a doctor account")
         return self
 
 

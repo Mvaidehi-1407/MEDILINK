@@ -37,7 +37,7 @@ class AuthService:
             user = await self.users.insert(doc)
         except DuplicateKeyError:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already registered")
-        await self._create_role_profile(user)
+        await self._create_role_profile(user, payload.doctor.model_dump() if payload.role == UserRole.DOCTOR and payload.doctor else None)
         if payload.role == UserRole.PATIENT and payload.caretakers:
             await self._create_caretaker_contacts(user["id"], payload.caretakers)
         return self._auth_response(user)
@@ -103,7 +103,7 @@ class AuthService:
         public = UserPublic(id=user["id"], name=user["name"], email=user["email"], role=user["role"], isActive=user.get("isActive", True))
         return AuthResponse(user=public, tokens=TokenResponse(accessToken=access, refreshToken=refresh, expiresAt=expires_at))
 
-    async def _create_role_profile(self, user: dict) -> None:
+    async def _create_role_profile(self, user: dict, extra: dict | None = None) -> None:
         collection = {
             "PATIENT": "patients",
             "CAREGIVER": "caregivers",
@@ -114,6 +114,7 @@ class AuthService:
             "userId": user["id"],
             "name": user["name"],
             "email": user["email"],
+            **(extra or {}),
             "createdAt": utcnow(),
             "updatedAt": utcnow(),
         })

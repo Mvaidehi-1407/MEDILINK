@@ -3,6 +3,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.dependencies import assert_owner_or_roles, db, get_current_user
 from app.models.enums import UserRole
+from app.services.doctor_access import assert_doctor_can_read
 from app.schemas.health import HealthReadingCreate
 from app.services.emergency_service import EmergencyService
 from app.services.health_service import HealthService
@@ -25,6 +26,7 @@ async def create_reading(payload: HealthReadingCreate, user: dict = Depends(get_
 @router.get("/current/{patient_id}")
 async def current(patient_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     assert_owner_or_roles(patient_id, user, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, user, patient_id, "view_vitals")
     reading = await HealthService(database).current(patient_id)
     if not reading:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No health readings found")
@@ -34,10 +36,12 @@ async def current(patient_id: str, user: dict = Depends(get_current_user), datab
 @router.get("/history/{patient_id}")
 async def history(patient_id: str, limit: int = 100, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     assert_owner_or_roles(patient_id, user, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, user, patient_id, "view_vitals")
     return await HealthService(database).history(patient_id, limit)
 
 
 @router.get("/trends/{patient_id}")
 async def trends(patient_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     assert_owner_or_roles(patient_id, user, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, user, patient_id, "view_vitals")
     return await HealthService(database).trends(patient_id)

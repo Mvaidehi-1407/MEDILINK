@@ -3,6 +3,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.dependencies import assert_owner_or_roles, db, get_current_user
 from app.models.enums import UserRole
+from app.services.doctor_access import assert_doctor_can_read
 from app.schemas.emergency import CommResultRequest, EmergencyCancelRequest, EmergencyConfirmRequest, EmergencyCreate, EmergencyNoResponseRequest, EmergencyResolveRequest
 from app.services.emergency_service import EmergencyService
 
@@ -31,6 +32,7 @@ async def active_emergencies(user: dict = Depends(get_current_user), database: A
 @router.get("/patient/{patient_id}")
 async def by_patient(patient_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     assert_owner_or_roles(patient_id, user, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, user, patient_id, "view_emergencies")
     return await EmergencyService(database).for_patient(patient_id)
 
 
@@ -38,6 +40,7 @@ async def by_patient(patient_id: str, user: dict = Depends(get_current_user), da
 async def get(emergency_id: str, _: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     emergency = await EmergencyService(database).get(emergency_id)
     assert_owner_or_roles(emergency["patientId"], _, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, _, emergency["patientId"], "view_emergencies")
     return emergency
 
 

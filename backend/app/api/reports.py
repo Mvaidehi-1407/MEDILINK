@@ -3,6 +3,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.dependencies import assert_owner_or_roles, db, get_current_user
 from app.models.enums import UserRole
+from app.services.doctor_access import assert_doctor_can_read
 from app.schemas.report import ReportOut
 from app.services.emergency_service import EmergencyService
 from app.services.report_generation_service import ReportGenerationService
@@ -18,6 +19,7 @@ async def generate_patient_summary(
     database: AsyncIOMotorDatabase = Depends(db),
 ):
     assert_owner_or_roles(patient_id, user, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, user, patient_id, "view_reports")
     return await ReportGenerationService(database).generate_patient_summary(patient_id, user["id"])
 
 
@@ -29,6 +31,7 @@ async def generate_emergency_incident_report(
 ):
     emergency = await EmergencyService(database).get(emergency_id)
     assert_owner_or_roles(emergency["patientId"], user, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, user, emergency["patientId"], "view_reports")
     return await ReportGenerationService(database).generate_emergency_incident_report(emergency_id, user["id"])
 
 
@@ -39,6 +42,7 @@ async def list_patient_reports(
     database: AsyncIOMotorDatabase = Depends(db),
 ):
     assert_owner_or_roles(patient_id, user, [UserRole.DOCTOR, UserRole.CAREGIVER, UserRole.HOSPITAL])
+    await assert_doctor_can_read(database, user, patient_id, "view_reports")
     from app.repositories.base import MongoRepository
 
     return await MongoRepository(database, "reports").list({"patientId": patient_id}, limit=50, sort=[("timestamp", -1)])

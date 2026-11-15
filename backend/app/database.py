@@ -56,3 +56,13 @@ async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     await db.revoked_refresh_tokens.create_index("expiresAt", expireAfterSeconds=0)
     await db.reports.create_index([("patientId", ASCENDING), ("timestamp", DESCENDING)])
     await db.emergency_contacts.create_index([("patientId", ASCENDING), ("isPrimary", DESCENDING)])
+    # Doctor portal (additive). conversations._id is the canonical "a:b" pair id, so one per pair.
+    await db.conversations.create_index([("doctorId", ASCENDING), ("active", ASCENDING)])
+    await db.consents.create_index([("requesterId", ASCENDING), ("kind", ASCENDING), ("status", ASCENDING)])
+    await db.messages.create_index([("senderId", ASCENDING), ("clientId", ASCENDING)], unique=True, partialFilterExpression={"clientId": {"$type": "string"}})
+    await db.audit_logs.create_index([("patientId", ASCENDING), ("at", DESCENDING)])
+    await db.qr_access_grants.create_index([("doctorId", ASCENDING), ("patientId", ASCENDING), ("shareJti", ASCENDING)], unique=True)
+    await db.follow_ups.create_index([("doctorId", ASCENDING), ("status", ASCENDING)])
+    await db.consultation_notes.create_index([("doctorId", ASCENDING), ("patientId", ASCENDING), ("date", DESCENDING)])
+    await db.alert_acks.create_index([("doctorId", ASCENDING), ("emergencyId", ASCENDING)], unique=True)
+    await db.notifications.create_index([("userId", ASCENDING), ("data.key", ASCENDING)])
