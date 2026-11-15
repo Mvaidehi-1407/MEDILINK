@@ -8,7 +8,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from app.api import auth, caregivers, consents, contacts, devices, doctors, emergencies, health, hospitals, location, medical_records, messages, notifications, patients, qr, reports, users, websockets
+from app.api import auth, caregivers, consents, contacts, devices, doctors, documents, emergencies, health, hospitals, location, medical_records, messages, notifications, patients, qr, reports, users, websockets
 from app.config import get_settings
 from app.database import close_mongo_connection, connect_to_mongo, get_database
 from app.logging_config import configure_logging, request_id_middleware
@@ -104,6 +104,7 @@ for router in [
     devices.router,
     emergencies.router,
     medical_records.router,
+    documents.router,
     messages.router,
     consents.router,
     notifications.router,
@@ -115,4 +116,5 @@ for router in [
     app.include_router(router, prefix=settings.api_prefix)
 
 app.include_router(websockets.router)
+app.include_router(qr.public_router)
 

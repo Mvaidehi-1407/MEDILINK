@@ -1,0 +1,10 @@
+OK   b92bd15ffea5f600 b92bd15ffea5f600 BLE region dashboard.dart (BleVitals..BlePage)
+OK   cf24821a7fdcbd0c cf24821a7fdcbd0c SOS logic: EmergencyPage widget + state fields/handlers (up to build)
+OK   084628686391b9b4 084628686391b9b4 SOS: RoleShell escalation/SOS listeners
+OK   8b95955c2425b74c 8b95955c2425b74c core/native_comm_service.dart
+OK   ae72e0ea07995049 ae72e0ea07995049 core/realtime_service.dart
+OK   8175e66191cabbf8 8175e66191cabbf8 MainActivity.kt
+OK   198ec2975039fa1e 198ec2975039fa1e Manifest permission lines
+OK   56ec4f7d94ff0329 56ec4f7d94ff0329 pubspec BLE/SMS/call/permission deps
+OK   b4b9d9ec4ad2d75e b4b9d9ec4ad2d75e firmware/esp32_ble/esp32_ble.ino
+RESULT: FROZEN (no diff)

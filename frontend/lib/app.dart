@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import 'core/session.dart';
 import 'features/auth_flow.dart';
 import 'features/dashboard.dart';
+import 'theme/app_theme.dart';
+import 'theme/tokens.dart';
+import 'ui/components.dart';
+import 'ui/fallback.dart';
 import 'widgets/common.dart';
 
 class MedilinkApp extends ConsumerWidget {
@@ -15,42 +20,28 @@ class MedilinkApp extends ConsumerWidget {
     return MaterialApp.router(
       title: 'MEDILINK',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: MedilinkColors.blue,
-          brightness: Brightness.light,
-          primary: MedilinkColors.blue,
-          secondary: MedilinkColors.teal,
-          error: MedilinkColors.red,
-          surface: Colors.white,
-        ),
-        scaffoldBackgroundColor: MedilinkColors.canvas,
-        cardTheme: const CardThemeData(
-          margin: EdgeInsets.zero,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(8)),
-          ),
-          color: Colors.white,
-        ),
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.all(Radius.circular(8)),
-          ),
-        ),
-      ),
+      theme: AppTheme.light(),
       // Senior Mode text scaling via MediaQuery/TextScaler (the modern, null-safe approach) --
       // TextTheme.apply(fontSizeFactor: ...) is unsafe here because Material 3's base text
       // theme can contain styles with fontSize: null, which .apply() cannot scale.
       builder: (context, child) {
         final mediaQuery = MediaQuery.of(context);
-        return MediaQuery(
-          data: mediaQuery.copyWith(
-            // Layer Senior Mode on top of whatever the device's own accessibility text-scale
-            // setting already is, rather than clobbering it.
-            textScaler: seniorMode ? mediaQuery.textScaler.clamp(minScaleFactor: 1.18) : mediaQuery.textScaler,
+        return AnnotatedRegion<SystemUiOverlayStyle>(
+          // Transparent status bar with dark icons, canvas-coloured navigation bar.
+          value: const SystemUiOverlayStyle(
+            statusBarColor: Colors.transparent,
+            statusBarIconBrightness: Brightness.dark,
+            systemNavigationBarColor: AppColors.canvas,
+            systemNavigationBarIconBrightness: Brightness.dark,
           ),
-          child: child!,
+          child: MediaQuery(
+            data: mediaQuery.copyWith(
+              // Layer Senior Mode on top of whatever the device's own accessibility text-scale
+              // setting already is, rather than clobbering it.
+              textScaler: seniorMode ? mediaQuery.textScaler.clamp(minScaleFactor: 1.18) : mediaQuery.textScaler,
+            ),
+            child: child!,
+          ),
         );
       },
       routerConfig: appRouter,
@@ -60,6 +51,13 @@ class MedilinkApp extends ConsumerWidget {
 
 final appRouter = GoRouter(
   initialLocation: '/',
+  // Unknown location: themed "page not found" instead of go_router's default error page.
+  errorBuilder: (context, state) => FallbackScreen(
+    kind: FallbackKind.notFound,
+    appBarTitle: 'MediLink',
+    actionLabel: 'Go home',
+    onAction: () => context.go('/'),
+  ),
   routes: [
     GoRoute(path: '/', builder: (_, __) => const StartupGate()),
     GoRoute(path: '/onboarding', builder: (_, __) => const OnboardingPage()),
@@ -86,10 +84,8 @@ class StartupGate extends ConsumerWidget {
       ),
     );
     return const Scaffold(
-      body: Center(
-        child: LoadingState(
-          label: 'MEDILINK\nMonitor. Detect. Connect. Respond.',
-        ),
+      body: BrandBackdrop(
+        child: Center(child: SplashBrand(tagline: 'Monitor. Detect. Connect. Respond.')),
       ),
     );
   }

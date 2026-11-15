@@ -8,7 +8,12 @@ import 'package:permission_handler/permission_handler.dart';
 import '../core/api_client.dart';
 import '../core/fcm_service.dart';
 import '../core/session.dart';
+import '../theme/tokens.dart';
+import '../ui/brand.dart';
+import '../ui/components.dart';
+import '../ui/onboarding.dart';
 import '../widgets/common.dart';
+import 'profile_pages.dart' show ServerSettingsPage;
 
 class OnboardingPage extends ConsumerStatefulWidget {
   const OnboardingPage({super.key});
@@ -50,98 +55,81 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
   @override
   Widget build(BuildContext context) => Scaffold(
     body: SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          children: [
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton(onPressed: _finish, child: const Text('Skip')),
-            ),
-            Expanded(
-              child: PageView.builder(
-                controller: _controller,
-                itemCount: _cards.length,
-                onPageChanged: (v) => setState(() => _page = v),
-                itemBuilder: (context, index) {
-                  final item = _cards[index];
-                  return Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Container(
-                        height: 220,
-                        width: 220,
-                        decoration: BoxDecoration(
-                          color: MedilinkColors.blue.withValues(alpha: .08),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Icon(
-                          item.$3,
-                          size: 100,
-                          color: MedilinkColors.teal,
-                        ),
-                      ),
-                      const SizedBox(height: 42),
-                      Text(
-                        item.$1,
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context).textTheme.headlineSmall
-                            ?.copyWith(fontWeight: FontWeight.w800),
-                      ),
-                      const SizedBox(height: 16),
-                      Text(item.$2, textAlign: TextAlign.center),
-                    ],
-                  );
-                },
-              ),
-            ),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: List.generate(
-                _cards.length,
-                (i) => Container(
-                  margin: const EdgeInsets.all(4),
-                  height: 8,
-                  width: i == _page ? 24 : 8,
-                  decoration: BoxDecoration(
-                    color: i == _page
-                        ? MedilinkColors.blue
-                        : Colors.blueGrey.shade200,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 24),
-            Row(
+      child: Column(
+        children: [
+          SizedBox(
+            width: double.infinity,
+            height: 56,
+            child: Stack(
+              alignment: Alignment.center,
               children: [
-                if (_page > 0)
-                  Expanded(
-                    child: OutlinedButton(
-                      onPressed: () => _controller.previousPage(
-                        duration: const Duration(milliseconds: 250),
-                        curve: Curves.easeOut,
-                      ),
-                      child: const Text('Back'),
-                    ),
-                  ),
-                if (_page > 0) const SizedBox(width: 12),
-                Expanded(
-                  child: PrimaryButton(
-                    label: _page == _cards.length - 1 ? 'Get started' : 'Next',
-                    onPressed: _page == _cards.length - 1
-                        ? _finish
-                        : () => _controller.nextPage(
-                            duration: const Duration(milliseconds: 250),
-                            curve: Curves.easeOut,
-                          ),
-                    icon: Icons.arrow_forward,
+                const MedilinkLockup(fontSize: 18),
+                Positioned(
+                  right: AppSpacing.xs,
+                  child: TextButton(
+                    onPressed: _finish,
+                    style: TextButton.styleFrom(foregroundColor: AppColors.inkSecondary),
+                    child: const Text('Skip'),
                   ),
                 ),
               ],
             ),
-          ],
-        ),
+          ),
+          Expanded(
+            child: PageView.builder(
+              controller: _controller,
+              itemCount: _cards.length,
+              onPageChanged: (v) => setState(() => _page = v),
+              itemBuilder: (context, index) {
+                final item = _cards[index];
+                return OnboardingCard(
+                  index: index,
+                  title: item.$1,
+                  body: item.$2,
+                  controller: _controller,
+                );
+              },
+            ),
+          ),
+          PageDots(controller: _controller, count: _cards.length, current: _page),
+          const SizedBox(height: AppSpacing.xl),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(AppSpacing.gutter, 0, AppSpacing.gutter, AppSpacing.md),
+            child: Row(
+              children: [
+                if (_page > 0)
+                  Expanded(
+                    flex: 2,
+                    child: PressScale(
+                      child: OutlinedButton(
+                        onPressed: () => _controller.previousPage(
+                          duration: const Duration(milliseconds: 250),
+                          curve: Curves.easeOut,
+                        ),
+                        child: const Text('Back'),
+                      ),
+                    ),
+                  ),
+                if (_page > 0) const SizedBox(width: AppSpacing.sm),
+                Expanded(
+                  flex: 3,
+                  child: PressScale(
+                    child: PrimaryButton(
+                      label: _page == _cards.length - 1 ? 'Get started' : 'Next',
+                      onPressed: _page == _cards.length - 1
+                          ? _finish
+                          : () => _controller.nextPage(
+                              duration: const Duration(milliseconds: 250),
+                              curve: Curves.easeOut,
+                            ),
+                      icon: Icons.arrow_forward,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     ),
   );
@@ -155,46 +143,39 @@ class WelcomePage extends StatelessWidget {
   const WelcomePage({super.key});
   @override
   Widget build(BuildContext context) => Scaffold(
-    body: SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Spacer(),
-            const Icon(
-              Icons.health_and_safety_outlined,
-              color: MedilinkColors.blue,
-              size: 58,
-            ),
-            const SizedBox(height: 24),
-            Text(
-              'MEDILINK',
-              style: Theme.of(context).textTheme.headlineLarge?.copyWith(
-                fontWeight: FontWeight.w900,
-                color: MedilinkColors.blue,
+    body: BrandBackdrop(
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(AppSpacing.gutter, AppSpacing.xl, AppSpacing.gutter, AppSpacing.md),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Spacer(flex: 3),
+              const Center(child: MedilinkLockup(fontSize: 34, vertical: true)),
+              const SizedBox(height: AppSpacing.md),
+              Text(
+                'Monitor. Detect. Connect. Respond.',
+                textAlign: TextAlign.center,
+                style: AppText.body.copyWith(fontSize: 16),
               ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Monitor. Detect. Connect. Respond.',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const Spacer(),
-            PrimaryButton(
-              label: 'Sign in',
-              onPressed: () => context.go('/login'),
-              icon: Icons.login,
-            ),
-            const SizedBox(height: 12),
-            OutlinedButton(
-              onPressed: () => context.go('/signup'),
-              style: OutlinedButton.styleFrom(
-                minimumSize: const Size.fromHeight(52),
+              const Spacer(flex: 4),
+              PrimaryButton(
+                label: 'Sign in',
+                onPressed: () => context.go('/login'),
+                icon: Icons.login_rounded,
               ),
-              child: const Text('Create account'),
-            ),
-          ],
+              const SizedBox(height: AppSpacing.sm),
+              OutlinedButton(
+                onPressed: () => context.go('/signup'),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                  backgroundColor: Colors.transparent,
+                  side: const BorderSide(color: AppColors.border),
+                ),
+                child: const Text('Create account'),
+              ),
+            ],
+          ),
         ),
       ),
     ),
@@ -244,105 +225,147 @@ class _AuthPageState extends ConsumerState<AuthPage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: Text(widget.login ? 'Sign in' : 'Create account')),
-    body: SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
-      child: Form(
-        key: _form,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              widget.login ? 'Welcome back' : 'Join MEDILINK',
-              style: Theme.of(context).textTheme.headlineSmall
-                  ?.copyWith(fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 24),
-            if (!widget.login) ...[
-              _field(_name, 'Full name', Icons.person_outline),
-              const SizedBox(height: 16),
-              DropdownButtonFormField<String>(
-                initialValue: _role,
-                decoration: const InputDecoration(labelText: 'Your role'),
-                items: const [
-                  DropdownMenuItem(value: 'PATIENT', child: Text('Patient')),
-                  DropdownMenuItem(
-                    value: 'CAREGIVER',
-                    child: Text('Caregiver'),
+    appBar: AppBar(
+      title: Text(
+        widget.login ? 'Sign in' : 'Create account',
+        style: AppText.titleSm.copyWith(color: AppColors.inkSecondary),
+      ),
+    ),
+    body: SafeArea(
+      top: false,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(AppSpacing.gutter, AppSpacing.xs, AppSpacing.gutter, AppSpacing.xl),
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        child: Form(
+          key: _form,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Align(alignment: Alignment.centerLeft, child: MedilinkMark(size: 48)),
+              const SizedBox(height: AppSpacing.md),
+              Text(widget.login ? 'Welcome back' : 'Join MEDILINK', style: AppText.headline),
+              const SizedBox(height: AppSpacing.xl),
+              if (!widget.login) ...[
+                _field(_name, 'Full name', Icons.person_outline_rounded),
+                const SizedBox(height: AppSpacing.md),
+                DropdownButtonFormField<String>(
+                  initialValue: _role,
+                  decoration: const InputDecoration(
+                    labelText: 'Your role',
+                    prefixIcon: Icon(Icons.badge_outlined),
                   ),
-                  DropdownMenuItem(value: 'DOCTOR', child: Text('Doctor')),
-                  DropdownMenuItem(value: 'HOSPITAL', child: Text('Hospital')),
-                ],
-                onChanged: (v) => setState(() => _role = v!),
-              ),
-              const SizedBox(height: 16),
-              _phoneField(
-                _phone,
-                'Phone number (+countrycode...)',
-                helperText: 'Used to log in and shared with doctors/caregivers you connect with.',
-              ),
-              const SizedBox(height: 16),
-            ],
-            if (widget.login)
-              _field(_identifier, 'Email or phone number', Icons.person_outline)
-            else
-              _field(_email, 'Email address', Icons.email_outlined),
-            const SizedBox(height: 16),
-            _field(_password, 'Password', Icons.lock_outline, obscure: true),
-            if (!widget.login) ...[
-              const SizedBox(height: 16),
-              _field(
-                _confirm,
-                'Confirm password',
-                Icons.lock_outline,
-                obscure: true,
-              ),
-              if (_role == 'PATIENT') ...[
-                const SizedBox(height: 24),
-                Text(
-                  'Emergency caretakers',
-                  style: Theme.of(context).textTheme.titleMedium
-                      ?.copyWith(fontWeight: FontWeight.w700),
+                  borderRadius: AppRadius.inputAll,
+                  dropdownColor: AppColors.surface,
+                  style: AppText.body.copyWith(color: AppColors.ink),
+                  icon: const Icon(Icons.expand_more_rounded),
+                  items: const [
+                    DropdownMenuItem(value: 'PATIENT', child: Text('Patient')),
+                    DropdownMenuItem(
+                      value: 'CAREGIVER',
+                      child: Text('Caregiver'),
+                    ),
+                    DropdownMenuItem(value: 'DOCTOR', child: Text('Doctor')),
+                    DropdownMenuItem(value: 'HOSPITAL', child: Text('Hospital')),
+                  ],
+                  onChanged: (v) => setState(() => _role = v!),
                 ),
-                const SizedBox(height: 4),
-                const Text(
-                  'Add 3 people to contact, in order, if we can\'t reach you during an emergency.',
+                const SizedBox(height: AppSpacing.md),
+                _phoneField(
+                  _phone,
+                  'Phone number (+countrycode...)',
+                  helperText: 'Used to log in and shared with doctors/caregivers you connect with.',
                 ),
-                const SizedBox(height: 12),
-                _caretakerFields(1, _care1Name, _care1Phone),
-                const SizedBox(height: 12),
-                _caretakerFields(2, _care2Name, _care2Phone),
-                const SizedBox(height: 12),
-                _caretakerFields(3, _care3Name, _care3Phone),
+                const SizedBox(height: AppSpacing.xl),
               ],
+              if (widget.login)
+                _field(_identifier, 'Email or phone number', Icons.person_outline_rounded)
+              else
+                _field(_email, 'Email address', Icons.mail_outline_rounded),
+              const SizedBox(height: AppSpacing.md),
+              _field(_password, 'Password', Icons.lock_outline_rounded, obscure: true),
+              if (!widget.login) ...[
+                const SizedBox(height: AppSpacing.md),
+                _field(
+                  _confirm,
+                  'Confirm password',
+                  Icons.lock_outline_rounded,
+                  obscure: true,
+                ),
+                if (_role == 'PATIENT') ...[
+                  const SizedBox(height: AppSpacing.xxl),
+                  Text('Emergency caretakers', style: AppText.title),
+                  const SizedBox(height: AppSpacing.xxs),
+                  Text(
+                    'Add 3 people to contact, in order, if we can\'t reach you during an emergency.',
+                    style: AppText.bodySm,
+                  ),
+                  const SizedBox(height: AppSpacing.md),
+                  _caretakerFields(1, _care1Name, _care1Phone),
+                  const SizedBox(height: AppSpacing.sm),
+                  _caretakerFields(2, _care2Name, _care2Phone),
+                  const SizedBox(height: AppSpacing.sm),
+                  _caretakerFields(3, _care3Name, _care3Phone),
+                ],
+              ],
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: AppSpacing.lg),
+                  child: Semantics(
+                    liveRegion: true,
+                    child: Container(
+                      padding: const EdgeInsets.all(AppSpacing.sm),
+                      decoration: BoxDecoration(
+                        color: AppColors.dangerTint,
+                        borderRadius: AppRadius.inputAll,
+                        border: Border.all(color: AppColors.danger.withValues(alpha: .25)),
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(Icons.error_outline_rounded, color: AppColors.danger, size: 20),
+                          const SizedBox(width: AppSpacing.xs + 2),
+                          Expanded(
+                            child: Text(
+                              _error!,
+                              style: AppText.bodySm.copyWith(color: AppColors.dangerPressed, fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              const SizedBox(height: AppSpacing.xl),
+              PrimaryButton(
+                label: widget.login ? 'Login' : 'Create account',
+                loading: _loading,
+                onPressed: _submit,
+                icon: widget.login ? Icons.login_rounded : Icons.arrow_forward,
+              ),
+              const SizedBox(height: AppSpacing.xs),
+              Center(
+                child: TextButton(
+                  onPressed: () =>
+                      context.go(widget.login ? '/signup' : '/login'),
+                  child: Text(
+                    widget.login
+                        ? 'Need an account? Sign up'
+                        : 'Already have an account? Sign in',
+                  ),
+                ),
+              ),
+              // A physical phone can't use the emulator's default server address.
+              Center(
+                child: TextButton.icon(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(builder: (_) => const ServerSettingsPage()),
+                  ),
+                  icon: const Icon(Icons.dns_outlined, size: 18),
+                  label: const Text('Server settings'),
+                ),
+              ),
             ],
-            if (_error != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 12),
-                child: Text(
-                  _error!,
-                  style: const TextStyle(color: MedilinkColors.red),
-                ),
-              ),
-            const SizedBox(height: 28),
-            PrimaryButton(
-              label: widget.login ? 'Login' : 'Create account',
-              loading: _loading,
-              onPressed: _submit,
-              icon: widget.login ? Icons.login : Icons.arrow_forward,
-            ),
-            Center(
-              child: TextButton(
-                onPressed: () =>
-                    context.go(widget.login ? '/signup' : '/login'),
-                child: Text(
-                  widget.login
-                      ? 'Need an account? Sign up'
-                      : 'Already have an account? Sign in',
-                ),
-              ),
-            ),
-          ],
+          ),
         ),
       ),
     ),
@@ -355,7 +378,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
   }) => TextFormField(
     controller: c,
     obscureText: obscure,
-    decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon)),
+    decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon, size: 22)),
     validator: (v) {
       if (v == null || v.trim().isEmpty) return '$label is required';
       if (label == 'Email address' && !v.contains('@'))
@@ -373,7 +396,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
         keyboardType: TextInputType.phone,
         decoration: InputDecoration(
           labelText: label,
-          prefixIcon: const Icon(Icons.phone_outlined),
+          prefixIcon: const Icon(Icons.phone_outlined, size: 22),
           helperText: helperText,
         ),
         validator: (v) {
@@ -385,19 +408,36 @@ class _AuthPageState extends ConsumerState<AuthPage> {
         },
       );
   Widget _caretakerFields(int index, TextEditingController name, TextEditingController phone) =>
-      Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('Caretaker $index', style: Theme.of(context).textTheme.labelLarge),
-          const SizedBox(height: 6),
-          TextFormField(
-            controller: name,
-            decoration: const InputDecoration(labelText: 'Name', prefixIcon: Icon(Icons.person_outline)),
-            validator: (v) => (v == null || v.trim().isEmpty) ? 'Caretaker name is required' : null,
-          ),
-          const SizedBox(height: 8),
-          _phoneField(phone, 'Phone number'),
-        ],
+      SectionCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 28,
+                  height: 28,
+                  alignment: Alignment.center,
+                  decoration: const BoxDecoration(color: AppColors.primaryTint, shape: BoxShape.circle),
+                  child: Text(
+                    '$index',
+                    style: AppText.caption.copyWith(color: AppColors.primaryPressed, fontWeight: FontWeight.w700, fontSize: 13),
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.sm - 2),
+                Text('Caretaker $index', style: AppText.bodyStrong),
+              ],
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            TextFormField(
+              controller: name,
+              decoration: const InputDecoration(labelText: 'Name', prefixIcon: Icon(Icons.person_outline_rounded, size: 22)),
+              validator: (v) => (v == null || v.trim().isEmpty) ? 'Caretaker name is required' : null,
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            _phoneField(phone, 'Phone number'),
+          ],
+        ),
       );
   Future<void> _submit() async {
     if (!_form.currentState!.validate()) return;
@@ -502,25 +542,23 @@ class _PermissionsPageState extends State<PermissionsPage> {
     }
     return Scaffold(
       appBar: AppBar(title: const Text('Permissions')),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
+      body: SafeArea(
+        top: false,
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(
-              'Set up safe monitoring',
-              style: Theme.of(context).textTheme.headlineSmall
-                  ?.copyWith(fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'MEDILINK needs every permission below before it can monitor you safely -- '
-              'each one is used only for real emergency response, never anything else.',
-            ),
-            const SizedBox(height: 24),
             Expanded(
               child: ListView(
+                padding: const EdgeInsets.fromLTRB(AppSpacing.gutter, AppSpacing.xs, AppSpacing.gutter, AppSpacing.md),
                 children: [
+                  Text('Set up safe monitoring', style: AppText.headline),
+                  const SizedBox(height: AppSpacing.xs),
+                  Text(
+                    'MEDILINK needs every permission below before it can monitor you safely -- '
+                    'each one is used only for real emergency response, never anything else.',
+                    style: AppText.body,
+                  ),
+                  const SizedBox(height: AppSpacing.xl),
                   PermissionTile(
                     icon: Icons.bluetooth_outlined,
                     title: 'Bluetooth',
@@ -563,10 +601,17 @@ class _PermissionsPageState extends State<PermissionsPage> {
             // amends/58: previously this always continued regardless of what was granted --
             // a denied permission failed silently later, at the exact moment of a real
             // emergency. Now disabled until every permission above is actually granted.
-            PrimaryButton(
-              label: _allGranted ? 'Continue to MEDILINK' : 'Grant all permissions to continue',
-              onPressed: _allGranted ? () => context.go('/app') : null,
-              icon: Icons.arrow_forward,
+            Container(
+              padding: const EdgeInsets.fromLTRB(AppSpacing.gutter, AppSpacing.sm, AppSpacing.gutter, AppSpacing.md),
+              decoration: const BoxDecoration(
+                color: AppColors.canvas,
+                border: Border(top: BorderSide(color: AppColors.border)),
+              ),
+              child: PrimaryButton(
+                label: _allGranted ? 'Continue to MEDILINK' : 'Grant all permissions to continue',
+                onPressed: _allGranted ? () => context.go('/app') : null,
+                icon: Icons.arrow_forward,
+              ),
             ),
           ],
         ),
@@ -625,42 +670,76 @@ class _PermissionTileState extends State<PermissionTile> {
     // so a permission nobody has asked about yet doesn't read as "you already said no".
     final deniedAfterAsking = _checked && !granted;
     final permanentlyDenied = _statuses.values.any((s) => s.isPermanentlyDenied);
+    final tint = {
+          Icons.bluetooth_outlined: AppColors.tintBlue,
+          Icons.location_on_outlined: AppColors.tintRed,
+          Icons.call_outlined: AppColors.tintMint,
+          Icons.sms_outlined: AppColors.tintAmber,
+          Icons.notifications_outlined: AppColors.tintViolet,
+        }[widget.icon] ??
+        AppColors.tintMint;
     return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
       child: SectionCard(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(widget.icon, color: MedilinkColors.blue),
-                title: Text(widget.title),
-                trailing: granted
-                    ? const Icon(Icons.check_circle, color: MedilinkColors.teal)
-                    : TextButton(
-                        onPressed: permanentlyDenied ? openAppSettings : _request,
-                        child: Text(permanentlyDenied ? 'Open Settings' : 'Allow'),
-                      ),
-              ),
-              Padding(
-                padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
-                child: Text(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            IconBadge(icon: widget.icon, tint: tint),
+            const SizedBox(width: AppSpacing.sm + 2),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    height: 44,
+                    child: Row(
+                      children: [
+                        Expanded(child: Text(widget.title, style: AppText.titleSm)),
+                        if (granted)
+                          const Icon(Icons.check_circle_rounded, color: AppColors.success, size: 24),
+                      ],
+                    ),
+                  ),
+                  Text(widget.explanation, style: AppText.bodySm),
                   // Clear explanation + a real way to retry (the same button, re-tappable) when
                   // denied, rather than the permission silently failing later mid-emergency.
-                  deniedAfterAsking
-                      ? (permanentlyDenied
-                            ? '${widget.explanation} Denied permanently -- enable it in Settings, then come back here.'
-                            : '${widget.explanation} You said no -- tap Allow to try again.')
-                      : widget.explanation,
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: deniedAfterAsking ? MedilinkColors.amber : null,
-                  ),
-                ),
+                  if (deniedAfterAsking) ...[
+                    const SizedBox(height: AppSpacing.xs),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Padding(
+                          padding: EdgeInsets.only(top: 1),
+                          child: Icon(Icons.info_outline_rounded, size: 18, color: AppColors.warning),
+                        ),
+                        const SizedBox(width: AppSpacing.xs - 2),
+                        Expanded(
+                          child: Text(
+                            permanentlyDenied
+                                ? 'Denied permanently -- enable it in Settings, then come back here.'
+                                : 'You said no -- tap Allow to try again.',
+                            style: AppText.bodySm.copyWith(color: AppColors.warning, fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  if (!granted) ...[
+                    const SizedBox(height: AppSpacing.sm),
+                    TextButton(
+                      onPressed: permanentlyDenied ? openAppSettings : _request,
+                      style: TextButton.styleFrom(
+                        backgroundColor: AppColors.primaryTint,
+                        foregroundColor: AppColors.primaryPressed,
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+                      ),
+                      child: Text(permanentlyDenied ? 'Open Settings' : 'Allow'),
+                    ),
+                  ],
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );

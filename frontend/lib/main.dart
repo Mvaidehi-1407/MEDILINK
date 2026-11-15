@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app.dart';
 import 'core/crash_reporting.dart';
+import 'ui/fallback.dart';
 
 void main() {
   // WidgetsFlutterBinding.ensureInitialized() and runApp() must run in the same zone -- calling
@@ -16,6 +17,8 @@ void main() {
     () async {
       WidgetsFlutterBinding.ensureInitialized();
       await CrashReporting.initialize();
+      // Friendly fallback instead of the red/grey crash box anywhere in the tree.
+      ErrorWidget.builder = fallbackErrorWidget;
       runApp(const ProviderScope(child: MedilinkApp()));
     },
     (error, stack) => CrashReporting.recordError(error, stack, reason: 'Uncaught zone error'),

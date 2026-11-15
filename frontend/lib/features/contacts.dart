@@ -21,7 +21,9 @@ class _ContactsPageState extends ConsumerState<ContactsPage> {
   }
 
   void _load() {
-    setState(() => _future = ref.read(apiClientProvider).emergencyContacts());
+    setState(() {
+      _future = ref.read(apiClientProvider).emergencyContacts();
+    });
   }
 
   Future<void> _openForm({Map<String, dynamic>? existing}) async {

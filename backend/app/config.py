@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     mongodb_database: str = "medilink"
     mongodb_server_selection_timeout_ms: int = 5000
 
-    jwt_secret_key: str
+    jwt_secret_key: str = Field(validation_alias=AliasChoices("JWT_SECRET", "JWT_SECRET_KEY", "jwt_secret_key"))
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_minutes: int = 60 * 24 * 7
@@ -33,10 +33,16 @@ class Settings(BaseSettings):
     call_provider_mode: str = "trial"
 
     nominatim_base_url: str = "https://nominatim.openstreetmap.org"
-    llm_api_key: Optional[str] = None
-    llm_model: str = "gemini-3.6-flash"
+    # GEMINI_* names are preferred; the older LLM_* names in existing .env files still work.
+    llm_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("GEMINI_API_KEY", "LLM_API_KEY", "llm_api_key"))
+    llm_model: str = Field("gemini-3.6-flash", validation_alias=AliasChoices("GEMINI_MODEL", "LLM_MODEL", "llm_model"))
     llm_timeout_seconds: float = 45.0
-    max_upload_bytes: int = 10 * 1024 * 1024
+    max_upload_bytes: int = 20 * 1024 * 1024
+    # Vault files live on the backend disk; only metadata goes to Mongo.
+    storage_dir: str = "./storage"
+    # Base URL a phone camera can open (LAN IP in dev, domain in prod) for QR share pages.
+    public_base_url: str = "http://localhost:8000"
+    qr_token_expire_minutes: int = 60
 
     risk_hr_warning: int = 110
     risk_hr_high: int = 135
@@ -97,7 +103,7 @@ class Settings(BaseSettings):
     # backend/.env instead of changing this class default.)
     emergency_cooldown_seconds: int = 0
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", populate_by_name=True)
 
     @field_validator("jwt_secret_key")
     @classmethod

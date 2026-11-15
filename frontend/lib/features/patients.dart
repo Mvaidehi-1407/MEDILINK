@@ -46,7 +46,9 @@ class _PatientConnectionsState extends ConsumerState<PatientConnections> {
   }
 
   void _load() {
-    setState(() => _future = _fetchConnectedPatients());
+    setState(() {
+      _future = _fetchConnectedPatients();
+    });
   }
 
   @override
@@ -324,7 +326,9 @@ class _PatientReportsPageState extends ConsumerState<PatientReportsPage> {
     _load();
   }
 
-  void _load() => setState(() => _reports = ref.read(apiClientProvider).list('/reports/patient/${widget.patientId}'));
+  void _load() => setState(() {
+      _reports = ref.read(apiClientProvider).list('/reports/patient/${widget.patientId}');
+    });
 
   @override
   Widget build(BuildContext context) => PageFrame(

@@ -68,7 +68,9 @@ class _EmergencyMapPageState extends ConsumerState<EmergencyMapPage> {
     return pins;
   }
 
-  void _load() => setState(() => _future = _fetchPins());
+  void _load() => setState(() {
+      _future = _fetchPins();
+    });
 
   @override
   Widget build(BuildContext context) => PageFrame(

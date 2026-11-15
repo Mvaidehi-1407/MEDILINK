@@ -5,15 +5,20 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/api_client.dart';
+import '../theme/tokens.dart';
+import '../ui/app_icons.dart';
+import '../ui/components.dart';
+import '../ui/fallback.dart';
 
+/// Legacy names kept for existing call sites; values now come from the design tokens.
 class MedilinkColors {
-  static const blue = Color(0xFF075985);
-  static const teal = Color(0xFF0F9D94);
-  static const green = Color(0xFF16803C);
-  static const amber = Color(0xFFB45309);
-  static const red = Color(0xFFBA1A1A);
-  static const purple = Color(0xFF6B21A8);
-  static const canvas = Color(0xFFF7FAFC);
+  static const blue = AppColors.accent;
+  static const teal = AppColors.primary;
+  static const green = AppColors.success;
+  static const amber = AppColors.warning;
+  static const red = AppColors.danger;
+  static const purple = Color(0xFF6A4FD3);
+  static const canvas = AppColors.canvas;
 }
 
 /// Reused across Patient/Caregiver/Hospital dashboards (Phase 14/20.13): shows where a
@@ -46,18 +51,7 @@ class EscalationStageBadge extends StatelessWidget {
     final (label, color) = _presentation();
     return Semantics(
       label: 'Escalation stage $label',
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: .12),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: color.withValues(alpha: .4)),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(color: color, fontWeight: FontWeight.w700, fontSize: 11),
-        ),
-      ),
+      child: StatusPill(label: label, color: color),
     );
   }
 }
@@ -76,20 +70,18 @@ class PrimaryButton extends StatelessWidget {
   final bool loading;
   @override
   Widget build(BuildContext context) => SizedBox(
-    height: 52,
     width: double.infinity,
     child: FilledButton.icon(
       onPressed: loading ? null : onPressed,
+      // Icon trails the label (arrow/login read as "go"); spinner replaces it while loading.
+      iconAlignment: IconAlignment.end,
       icon: loading
           ? const SizedBox.square(
               dimension: 20,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white,
-              ),
+              child: CircularProgressIndicator(strokeWidth: 2.4, color: AppColors.inkMuted),
             )
-          : Icon(icon),
-      label: Text(label),
+          : Icon(icon, size: 20),
+      label: Text(label, textAlign: TextAlign.center),
     ),
   );
 }
@@ -110,21 +102,7 @@ class StatusBadge extends StatelessWidget {
         : MedilinkColors.green;
     return Semantics(
       label: 'Status $label',
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: .12),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Text(
-          label.replaceAll('_', ' '),
-          style: TextStyle(
-            color: color,
-            fontWeight: FontWeight.w700,
-            fontSize: 12,
-          ),
-        ),
-      ),
+      child: StatusPill(label: label.replaceAll('_', ' '), color: color),
     );
   }
 }
@@ -134,40 +112,39 @@ class LoadingState extends StatelessWidget {
   final String label;
   @override
   Widget build(BuildContext context) => Center(
-    child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        const CircularProgressIndicator(),
-        const SizedBox(height: 16),
-        Text(label),
-      ],
+    child: SingleChildScrollView(
+      padding: const EdgeInsets.all(AppSpacing.gutter),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SkeletonList(),
+          const SizedBox(height: AppSpacing.sm),
+          Semantics(
+            liveRegion: true,
+            child: Text(label, textAlign: TextAlign.center, style: AppText.body),
+          ),
+        ],
+      ),
     ),
   );
 }
 
+/// Error body for lists and pages. Uses the app-wide [FallbackView]; raw exception text is never
+/// shown, while server messages written for people are kept.
 class ErrorState extends StatelessWidget {
   const ErrorState({super.key, required this.message, required this.onRetry});
   final String message;
   final VoidCallback onRetry;
   @override
-  Widget build(BuildContext context) => Center(
-    child: Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(
-            Icons.cloud_off_rounded,
-            size: 44,
-            color: MedilinkColors.red,
-          ),
-          const SizedBox(height: 12),
-          Text(message, textAlign: TextAlign.center),
-          TextButton(onPressed: onRetry, child: const Text('Try again')),
-        ],
-      ),
-    ),
-  );
+  Widget build(BuildContext context) {
+    final kind = fallbackKindFor(message);
+    return FallbackView(
+      kind: kind,
+      message: kind == FallbackKind.offline || looksRaw(message) ? null : message,
+      actionLabel: 'Try again',
+      onAction: onRetry,
+    );
+  }
 }
 
 class EmptyState extends StatelessWidget {
@@ -183,15 +160,18 @@ class EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Center(
     child: Padding(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(AppSpacing.xl),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 46, color: MedilinkColors.blue),
-          const SizedBox(height: 12),
-          Text(title, style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 6),
-          Text(detail, textAlign: TextAlign.center),
+          IconBadge(icon: icon, tint: AppColors.tintBlue, size: 64),
+          const SizedBox(height: AppSpacing.md),
+          Text(title, textAlign: TextAlign.center, style: AppText.titleSm),
+          const SizedBox(height: AppSpacing.xxs + 2),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 320),
+            child: Text(detail, textAlign: TextAlign.center, style: AppText.body),
+          ),
         ],
       ),
     ),
@@ -261,26 +241,24 @@ class _OfflineBannerState extends ConsumerState<OfflineBanner> {
   Widget build(BuildContext context) {
     if (_state == _ConnectionState.online) return const SizedBox.shrink();
     final (message, icon) = switch (_state) {
-      _ConnectionState.deviceOffline => ('Offline. Actions will be available when your connection returns.', Icons.cloud_off),
+      _ConnectionState.deviceOffline => ('Offline. Actions will be available when your connection returns.', Icons.cloud_off_rounded),
       _ConnectionState.backendUnreachable => ("Can't reach MediLink servers. Retrying...", Icons.dns_outlined),
-      _ConnectionState.reconnecting => ('Reconnecting...', Icons.sync),
-      _ConnectionState.online => ('', Icons.cloud_done),
+      _ConnectionState.reconnecting => ('Reconnecting...', Icons.sync_rounded),
+      _ConnectionState.online => ('', Icons.cloud_done_outlined),
     };
     return Container(
-    width: double.infinity,
-    color: const Color(0xFFFFF3CD),
-    padding: const EdgeInsets.all(10),
-    child: Row(
-      children: [
-        Icon(icon, size: 18),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            message,
+      width: double.infinity,
+      color: AppColors.warningTint,
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.gutter, vertical: AppSpacing.sm - 2),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: AppColors.warning),
+          const SizedBox(width: AppSpacing.sm - 2),
+          Expanded(
+            child: Text(message, style: AppText.bodySm.copyWith(color: AppColors.ink, fontWeight: FontWeight.w500)),
           ),
-        ),
-      ],
-    ),
+        ],
+      ),
     );
   }
 }
@@ -294,9 +272,12 @@ class SectionCard extends StatelessWidget {
   final Widget child;
   final EdgeInsets padding;
   @override
-  Widget build(BuildContext context) => Card(
-    elevation: 0,
-    clipBehavior: Clip.antiAlias,
-    child: Padding(padding: padding, child: child),
+  Widget build(BuildContext context) => DecoratedBox(
+    decoration: const BoxDecoration(borderRadius: AppRadius.cardAll, boxShadow: AppElevation.card),
+    child: Card(
+      elevation: 0,
+      clipBehavior: Clip.antiAlias,
+      child: Padding(padding: padding, child: child),
+    ),
   );
 }

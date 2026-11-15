@@ -60,7 +60,8 @@ async def request_id_middleware(request, call_next):
         logger.info(
             "%s %s -> %d (%.1fms)",
             request.method,
-            request.url.path,
+            # Share-page tokens are credentials; keep them out of logs.
+            "/share/<redacted>" if request.url.path.startswith("/share/") else request.url.path,
             response.status_code,
             (time.monotonic() - started) * 1000,
         )

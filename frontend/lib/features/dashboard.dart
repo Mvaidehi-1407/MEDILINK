@@ -3,19 +3,23 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:qr_flutter/qr_flutter.dart';
 
 import '../core/api_client.dart';
 import '../core/native_comm_service.dart';
 import '../core/realtime_service.dart';
 import '../core/session.dart';
+import '../theme/tokens.dart';
+import '../ui/app_icons.dart';
+import '../ui/components.dart';
+import '../ui/fallback.dart';
+import '../ui/format.dart';
 import '../widgets/common.dart';
 import 'contacts.dart';
 import 'emergency_map.dart';
@@ -23,6 +27,8 @@ import 'find_hospitals.dart';
 import 'medical_vault.dart';
 import 'messaging.dart';
 import 'patients.dart';
+import 'profile_pages.dart';
+import 'qr_access.dart';
 
 Future<T?> _open<T>(BuildContext c, Widget p) =>
     Navigator.of(c).push<T>(MaterialPageRoute(builder: (_) => p));
@@ -40,8 +46,10 @@ class PageFrame extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
-      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
-      actions: actions,
+      title: Text(title),
+      // Gutter-aligned title on tab roots; normal spacing after a back arrow.
+      titleSpacing: (ModalRoute.of(context)?.impliesAppBarDismissal ?? false) ? 0 : AppSpacing.gutter,
+      actions: [...actions, const SizedBox(width: AppSpacing.xs)],
     ),
     body: child,
   );
@@ -304,29 +312,36 @@ class _RoleShellState extends ConsumerState<RoleShell>
           ],
         ),
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: index,
-        onDestinationSelected: (v) => setState(() => index = v),
-        labelTextStyle: WidgetStateProperty.all(const TextStyle(fontSize: 11)),
-        destinations: labels
-            .map((l) => NavigationDestination(icon: Icon(_icon(l)), label: l))
-            .toList(),
+      bottomNavigationBar: DecoratedBox(
+        decoration: const BoxDecoration(
+          border: Border(top: BorderSide(color: AppColors.border)),
+        ),
+        // Nav chrome stays at 1.0x text so 5 labels never break mid-word (Senior Mode scales content).
+        child: MediaQuery.withClampedTextScaling(
+          maxScaleFactor: 1.0,
+          child: MedilinkNavBar(
+            selectedIndex: index,
+            onDestinationSelected: (v) => setState(() => index = v),
+            items: labels.map(_navItem).toList(),
+          ),
+        ),
       ),
     );
   }
 
-  IconData _icon(String l) =>
-      l == 'Emergency' || l == 'Emergencies' || l == 'Alerts'
-      ? Icons.emergency_outlined
-      : l == 'Health'
-      ? Icons.monitor_heart_outlined
-      : l == 'Profile'
-      ? Icons.person_outline
-      : l == 'Messages'
-      ? Icons.chat_bubble_outline
-      : l == 'Patients'
-      ? Icons.groups_outlined
-      : Icons.home_outlined;
+  // Reference icons (cropped from the approved screenshots) where the references show them;
+  // Material icons for clinician-only tabs the references don't cover.
+  NavItem _navItem(String l) => switch (l) {
+    'Home' => const NavItem('Home', asset: AppIcons.navHome),
+    'Health' => const NavItem('Health', asset: AppIcons.navHealth),
+    'Emergency' || 'Emergencies' || 'Alerts' => NavItem(l, asset: AppIcons.navSiren),
+    'Connections' => const NavItem('Connections', asset: AppIcons.navConnections),
+    'Profile' => const NavItem('Profile', asset: AppIcons.navProfile),
+    'Patients' => const NavItem('Patients', icon: Icons.groups_outlined),
+    'Messages' => const NavItem('Messages', icon: Icons.chat_bubble_outline),
+    'Command' => const NavItem('Command', icon: Icons.space_dashboard_outlined),
+    _ => NavItem(l, icon: Icons.circle_outlined),
+  };
 }
 
 class RoleOverview extends StatelessWidget {
@@ -490,57 +505,88 @@ class _PatientHomeState extends ConsumerState<PatientHome> {
     final id = ref.watch(sessionProvider).userId;
     if (id.isNotEmpty) _ensureSubscribed(id);
     final reading = ref.watch(currentReadingProvider(id));
-    return PageFrame(
-      title: 'Good day',
-      actions: [
-        IconButton(
-          onPressed: () => _open(context, const NotificationsPage()),
-          icon: const Icon(Icons.notifications_none),
-        ),
-      ],
-      child: ListView(
-        padding: const EdgeInsets.all(16),
+    return Scaffold(
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(AppSpacing.gutter, AppSpacing.lg, AppSpacing.gutter, AppSpacing.xl),
         children: [
-          HealthStatusCard(patientId: id),
-          const SizedBox(height: 16),
-          AiInsightCard(reading: reading),
-          const SizedBox(height: 16),
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              ActionTile(
-                'Health',
-                Icons.monitor_heart_outlined,
-                () => _open(context, const HealthPage()),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Semantics(
+                      header: true,
+                      label: 'Good day',
+                      excludeSemantics: true,
+                      child: Text(
+                        'Good day \u{1F44B}',
+                        style: AppText.headline.copyWith(fontSize: 30, fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                    const SizedBox(height: AppSpacing.xxs),
+                    Text('Your health, our priority', style: AppText.body.copyWith(fontSize: 16)),
+                  ],
+                ),
               ),
-              ActionTile(
-                'Emergency',
-                Icons.emergency_outlined,
-                () => _open(context, const EmergencyPage()),
+              const SizedBox(width: AppSpacing.sm),
+              IconButton(
+                tooltip: 'Notifications',
+                onPressed: () => _open(context, const NotificationsPage()),
+                style: IconButton.styleFrom(
+                  backgroundColor: AppColors.surface,
+                  side: const BorderSide(color: AppColors.border),
+                  minimumSize: const Size(52, 52),
+                ),
+                icon: const Icon(Icons.notifications_none, color: AppColors.ink),
               ),
-              ActionTile(
-                'Vault',
-                Icons.folder_copy_outlined,
-                () => _open(context, const MedicalVaultPage()),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.xl),
+          HealthStatusCard(patientId: id),
+          const SizedBox(height: AppSpacing.md),
+          AiInsightCard(reading: reading),
+          const SizedBox(height: AppSpacing.lg),
+          TileGrid(
+            children: [
+              FeatureTile(
+                title: 'Health',
+                subtitle: 'Track your health information',
+                leading: const AssetBadge(AppIcons.badgeHealth, size: 56),
+                onTap: () => _open(context, const HealthPage()),
               ),
-              // Existing home-screen hospital tile -- unchanged icon, label, colour and position.
-              // Only its destination moved, from the backend-registered HospitalsPage to the
-              // key-less OpenStreetMap "Find my hospital" search (Phase 21).
-              ActionTile(
-                'Hospitals',
-                Icons.local_hospital_outlined,
-                () => _open(context, const FindHospitalsPage()),
+              FeatureTile(
+                title: 'Emergency',
+                subtitle: 'Get immediate assistance',
+                leading: const AssetBadge(AppIcons.badgeEmergency, size: 56),
+                onTap: () => _open(context, const EmergencyPage()),
               ),
-              ActionTile(
-                'QR',
-                Icons.qr_code_2_outlined,
-                () => _open(context, const QrPage()),
+              FeatureTile(
+                title: 'Vault',
+                subtitle: 'Secure your medical records',
+                leading: const AssetBadge(AppIcons.badgeVault, size: 56),
+                onTap: () => _open(context, const MedicalVaultPage()),
               ),
-              ActionTile(
-                'Messages',
-                Icons.chat_bubble_outline,
-                () => _open(context, const ChatPage()),
+              // Existing home-screen hospital tile -- destination unchanged: the key-less
+              // OpenStreetMap "Find my hospital" search (Phase 21).
+              FeatureTile(
+                title: 'Hospitals',
+                subtitle: 'Find nearby hospitals',
+                leading: const AssetBadge(AppIcons.badgeHospitals, size: 56),
+                onTap: () => _open(context, const FindHospitalsPage()),
+              ),
+              FeatureTile(
+                title: 'QR',
+                subtitle: 'Quick access to your health ID',
+                leading: const AssetBadge(AppIcons.badgeQr, size: 56),
+                onTap: () => _open(context, const QrPage()),
+              ),
+              FeatureTile(
+                title: 'Messages',
+                subtitle: 'Talk to your doctor',
+                leading: const AssetBadge(AppIcons.badgeMessages, size: 56),
+                onTap: () => _open(context, const ChatPage()),
               ),
             ],
           ),
@@ -557,50 +603,87 @@ class HealthStatusCard extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(currentReadingProvider(patientId));
     return state.when(
-      loading: () => const SectionCard(
-        child: SizedBox(height: 150, child: LoadingState()),
+      loading: () => SectionCard(
+        child: Row(
+          children: [
+            const AssetBadge(AppIcons.badgeHeart, size: 60),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Loading your care data...', style: AppText.titleSm.copyWith(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 2),
+                  Text('Please wait while we analyze your information', style: AppText.bodySm),
+                ],
+              ),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            const SizedBox.square(
+              dimension: 30,
+              child: CircularProgressIndicator(
+                strokeWidth: 3.5,
+                strokeCap: StrokeCap.round,
+                color: AppColors.accent,
+                backgroundColor: AppColors.accentTint,
+              ),
+            ),
+          ],
+        ),
       ),
+      // Never shows exception text: themed fallback, existing retry action kept.
       error: (e, s) => SectionCard(
-        child: ErrorState(
-          message: e.toString(),
-          onRetry: () => ref.invalidate(currentReadingProvider(patientId)),
+        child: FallbackView(
+          kind: fallbackKindFor(e.toString()),
+          compact: true,
+          title: 'Vitals unavailable',
+          message: "We couldn't load your latest reading.",
+          actionLabel: 'Try again',
+          onAction: () => ref.invalidate(currentReadingProvider(patientId)),
         ),
       ),
       data: (data) {
         final risk = data?['risk'] as Map?;
+        final timestamp = data?['timestamp'];
         return SectionCard(
+          padding: const EdgeInsets.all(AppSpacing.lg),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(
                 children: [
-                  const Expanded(
-                    child: Text(
-                      'HEALTH STATUS',
-                      style: TextStyle(fontWeight: FontWeight.w800),
-                    ),
+                  const AssetBadge(AppIcons.badgeHeart, size: 44),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: Text('Health status', style: AppText.titleSm.copyWith(fontWeight: FontWeight.w700)),
                   ),
                   StatusBadge(
                     label: risk?['riskLevel']?.toString() ?? 'STABLE',
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
-              Text(
-                '${data?['heartRate'] ?? '--'} BPM',
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  fontWeight: FontWeight.w900,
-                  color: MedilinkColors.blue,
-                ),
+              const SizedBox(height: AppSpacing.lg),
+              VitalsHero(
+                heartRate: data?['heartRate'],
+                spo2: data?['spo2'],
+                systolic: data?['systolicBP'],
+                diastolic: data?['diastolicBP'],
+                temperature: data?['temperature'],
               ),
-              const SizedBox(height: 12),
-              Text(
-                'SpO2 ${data?['spo2'] ?? '--'}%   BP ${data?['systolicBP'] ?? '--'}/${data?['diastolicBP'] ?? '--'}   Temp ${data?['temperature'] ?? '--'} C',
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Last sync: ${data?['timestamp'] ?? 'No readings yet'}',
-                style: Theme.of(context).textTheme.bodySmall,
+              const SizedBox(height: AppSpacing.md),
+              const Divider(),
+              const SizedBox(height: AppSpacing.sm),
+              Row(
+                children: [
+                  const Icon(Icons.schedule_rounded, size: 16, color: AppColors.inkSecondary),
+                  const SizedBox(width: AppSpacing.xs - 2),
+                  Expanded(
+                    child: Text(
+                      'Last sync: ${timestamp == null ? 'No readings yet' : formatTimestamp(timestamp)}',
+                      style: AppText.bodySm,
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
@@ -616,8 +699,38 @@ class AiInsightCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return reading.when(
-      loading: () => const SectionCard(
-        child: SizedBox(height: 90, child: LoadingState(label: 'Analyzing...')),
+      loading: () => SectionCard(
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Image.asset(AppIcons.insightBars, width: 26, height: 30, excludeFromSemantics: true),
+                      const SizedBox(width: AppSpacing.sm),
+                      Text('Analyzing...', style: AppText.titleSm.copyWith(fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                  const SizedBox(height: AppSpacing.xxs),
+                  Text('Getting insights for better care', style: AppText.bodySm),
+                  const SizedBox(height: AppSpacing.md),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                    child: const LinearProgressIndicator(
+                      minHeight: 8,
+                      color: AppColors.primary,
+                      backgroundColor: AppColors.accentTint,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Image.asset(AppIcons.illusStethoscope, width: 84, excludeFromSemantics: true),
+          ],
+        ),
       ),
       error: (e, s) => const SizedBox.shrink(),
       data: (data) {
@@ -625,27 +738,26 @@ class AiInsightCard extends StatelessWidget {
         final recommendation = risk?['recommendation']?.toString();
         final engineUsed = risk?['engineUsed']?.toString();
         return SectionCard(
-          child: Column(
+          child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                'AI insight',
-                style: TextStyle(fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                recommendation ?? 'No readings yet. Insight will appear once vitals are recorded.',
-              ),
-              if (engineUsed != null) ...[
-                const SizedBox(height: 4),
-                Text(
-                  'Engine: $engineUsed',
-                  style: const TextStyle(color: Colors.blueGrey, fontSize: 12),
+              Image.asset(AppIcons.insightBars, width: 26, height: 30, excludeFromSemantics: true),
+              const SizedBox(width: AppSpacing.md),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('AI insight', style: AppText.titleSm.copyWith(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: AppSpacing.xxs),
+                    Text(
+                      recommendation ?? 'No readings yet. Insight will appear once vitals are recorded.',
+                      style: AppText.body,
+                    ),
+                    const SizedBox(height: AppSpacing.xs),
+                    if (engineUsed != null) Text('Engine: ${humanizeEnum(engineUsed)}', style: AppText.caption),
+                    Text('Informational only. Not a medical diagnosis.', style: AppText.caption),
+                  ],
                 ),
-              ],
-              const Text(
-                'Informational only. Not a medical diagnosis.',
-                style: TextStyle(color: Colors.blueGrey),
               ),
             ],
           ),
@@ -662,22 +774,27 @@ class HealthPage extends ConsumerWidget {
     return PageFrame(
       title: 'Health',
       child: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(AppSpacing.gutter, AppSpacing.xs, AppSpacing.gutter, AppSpacing.xl),
         children: [
           HealthStatusCard(patientId: ref.watch(sessionProvider).userId),
-          const SizedBox(height: 16),
+          const SizedBox(height: AppSpacing.sm),
           const BleNoDeviceCard(),
-          const SizedBox(height: 16),
-          const SectionCard(
-            child: SizedBox(
-              height: 130,
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text('Health trends: 24H | 7D | 30D'),
-                  Icon(Icons.show_chart, size: 64, color: MedilinkColors.teal),
-                ],
-              ),
+          const SizedBox(height: AppSpacing.sm),
+          // Trends are not fetched yet (ApiClient.healthHistory is never called): honest placeholder,
+          // no fake chart data.
+          SectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Health trends', style: AppText.titleSm.copyWith(fontWeight: FontWeight.w700)),
+                const SizedBox(height: AppSpacing.md),
+                const FallbackView(
+                  kind: FallbackKind.comingSoon,
+                  compact: true,
+                  title: 'Trends coming soon',
+                  message: 'Your 24-hour, 7-day and 30-day charts will appear here.',
+                ),
+              ],
             ),
           ),
         ],
@@ -2530,155 +2647,207 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
     }
   }
 
+  // ---- UI (build) ----
   @override
-  Widget build(BuildContext context) => PageFrame(
-    title: 'Emergency',
-    child: Container(
-      color: _activeId != null
-          ? MedilinkColors.red.withValues(alpha: .06)
-          : null,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: _activeId == null
-              ? _idleContent(context)
-              : resolved
-              ? _resolvedContent(context)
-              : _verifyingContent(context),
+  Widget build(BuildContext context) {
+    final bg = _activeId != null ? AppColors.dangerTint : AppColors.canvas;
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(
+        backgroundColor: bg,
+        title: const Text('Emergency'),
+        actions: [
+          IconButton(
+            tooltip: 'Notifications',
+            onPressed: () => _open(context, const NotificationsPage()),
+            icon: const Icon(Icons.notifications_none_rounded),
+          ),
+          const SizedBox(width: AppSpacing.xs),
+        ],
+      ),
+      // Scrolls only if it must (large text); otherwise stays vertically centred. No decorative motion.
+      body: LayoutBuilder(
+        builder: (context, box) => SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.gutter, vertical: AppSpacing.lg),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: box.maxHeight - 2 * AppSpacing.lg),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: _activeId == null
+                  ? _idleContent(context)
+                  : resolved
+                  ? _resolvedContent(context)
+                  : _verifyingContent(context),
+            ),
+          ),
         ),
+      ),
+    );
+  }
+
+  /// Neutral strip for the page's own status `message` (unchanged text).
+  Widget _messageStrip(String text) => Padding(
+    padding: const EdgeInsets.only(top: AppSpacing.md),
+    child: Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(AppSpacing.sm),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: AppRadius.inputAll,
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.info_outline_rounded, size: 20, color: AppColors.inkSecondary),
+          const SizedBox(width: AppSpacing.xs),
+          Expanded(child: Text(text, style: AppText.bodySm.copyWith(color: AppColors.ink))),
+        ],
       ),
     ),
   );
 
   List<Widget> _idleContent(BuildContext context) => [
-    const Icon(Icons.shield_outlined, size: 82, color: MedilinkColors.blue),
-    const SizedBox(height: 20),
+    const AssetBadge(AppIcons.badgeEmergency, size: 112),
+    const SizedBox(height: AppSpacing.lg),
+    Text('Emergency SOS', textAlign: TextAlign.center, style: AppText.headline),
+    const SizedBox(height: AppSpacing.xs),
     Text(
-      'Emergency SOS',
-      style: Theme.of(context).textTheme.headlineSmall
-          ?.copyWith(fontWeight: FontWeight.w900, color: MedilinkColors.blue),
-    ),
-    const SizedBox(height: 12),
-    const Text(
       'Press and hold below if you need help. This starts the same verification and caretaker-calling flow as an automatically detected emergency.',
       textAlign: TextAlign.center,
+      style: AppText.body,
     ),
-    const SizedBox(height: 28),
+    const SizedBox(height: AppSpacing.xxl),
     GestureDetector(
       onTapDown: (_) => _startSosHold(),
       onTapUp: (_) => _cancelSosHold(),
-      onTapCancel: _cancelSosHold,
+      onTapCancel: () {
+        // A completed hold swaps this screen for the countdown, which disposes this detector
+        // mid-gesture; it then reports a cancel while the tree is locked. The hold timer has
+        // already finished by then, so only stop it (no setState). Otherwise unchanged.
+        if (SchedulerBinding.instance.schedulerPhase == SchedulerPhase.persistentCallbacks) {
+          sosHoldTimer?.cancel();
+        } else {
+          _cancelSosHold();
+        }
+      },
       child: Container(
         width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 18),
+        constraints: const BoxConstraints(minHeight: 76),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.lg),
         decoration: BoxDecoration(
-          color: MedilinkColors.red.withValues(
-            alpha: 0.08 + sosHoldProgress * 0.5,
-          ),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: MedilinkColors.red, width: 2),
+          color: Color.lerp(AppColors.surface, AppColors.dangerTint, .4 + sosHoldProgress * .6),
+          borderRadius: BorderRadius.circular(AppRadius.pill),
+          border: Border.all(color: AppColors.danger, width: 2),
         ),
         child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
             if (sosSending)
-              const CircularProgressIndicator(color: MedilinkColors.red)
+              const CircularProgressIndicator(color: AppColors.danger)
             else
-              const Text(
-                'PRESS AND HOLD FOR SOS',
-                style: TextStyle(
-                  fontWeight: FontWeight.w800,
-                  color: MedilinkColors.red,
-                ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.call, color: AppColors.danger, size: 24),
+                  const SizedBox(width: AppSpacing.sm - 2),
+                  Flexible(
+                    child: Text(
+                      'PRESS AND HOLD FOR SOS',
+                      textAlign: TextAlign.center,
+                      style: AppText.label.copyWith(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        color: AppColors.danger,
+                        letterSpacing: .3,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             if (sosHoldProgress > 0 && !sosSending) ...[
-              const SizedBox(height: 10),
+              const SizedBox(height: AppSpacing.sm),
               LinearProgressIndicator(
                 value: sosHoldProgress,
-                color: MedilinkColors.red,
+                color: AppColors.danger,
+                backgroundColor: AppColors.surface,
               ),
             ],
           ],
         ),
       ),
     ),
-    if (message != null)
-      Padding(padding: const EdgeInsets.only(top: 16), child: Text(message!)),
+    if (message != null) _messageStrip(message!),
   ];
 
   List<Widget> _verifyingContent(BuildContext context) => [
-    const Icon(Icons.emergency, size: 82, color: MedilinkColors.red),
-    const SizedBox(height: 20),
+    const AssetBadge(AppIcons.badgeEmergency, size: 112),
+    const SizedBox(height: AppSpacing.lg),
     Text(
       'POTENTIAL EMERGENCY',
-      style: Theme.of(context).textTheme.headlineSmall
-          ?.copyWith(fontWeight: FontWeight.w900, color: MedilinkColors.red),
+      textAlign: TextAlign.center,
+      style: AppText.headline.copyWith(color: AppColors.danger, fontWeight: FontWeight.w800),
     ),
-    const SizedBox(height: 12),
+    const SizedBox(height: AppSpacing.xs),
     Text(
       panicAttackType != null && panicAttackType != 'NONE_DETECTED'
           ? 'Possible panic-attack pattern detected. This is decision-support information, not a diagnosis.'
           : 'An abnormal health pattern has been detected.',
       textAlign: TextAlign.center,
+      style: AppText.body.copyWith(color: AppColors.ink),
     ),
-    const SizedBox(height: 20),
+    const SizedBox(height: AppSpacing.lg),
     if (loadingCountdown)
-      const CircularProgressIndicator()
+      const CircularProgressIndicator(color: AppColors.danger)
     else
       Semantics(
         liveRegion: true,
         label: 'Confirmation countdown: $seconds seconds remaining',
         child: Text(
           '$seconds',
-          style: Theme.of(context).textTheme.displayLarge?.copyWith(
-            fontWeight: FontWeight.w900,
-            color: MedilinkColors.red,
-            fontSize: 72,
-          ),
+          style: appNumeral.copyWith(fontSize: 88, color: AppColors.danger),
         ),
       ),
-    const Text(
-      'seconds to respond',
-      style: TextStyle(fontWeight: FontWeight.w700),
-    ),
-    const SizedBox(height: 24),
-    PrimaryButton(
+    const SizedBox(height: AppSpacing.xxs),
+    Text('seconds to respond', style: AppText.bodyStrong),
+    const SizedBox(height: AppSpacing.xl),
+    SafetyButton(
       label: "I'm OK",
       onPressed: () => _action('cancel'),
       loading: _pendingAction == 'cancel',
       icon: Icons.check_circle_outline,
     ),
-    const SizedBox(height: 12),
-    SizedBox(
+    const SizedBox(height: AppSpacing.sm),
+    SafetyButton(
+      label: 'I NEED HELP',
+      tone: SafetyTone.danger,
+      onPressed: _pendingAction == 'confirm' ? null : () => _action('confirm'),
+      loading: _pendingAction == 'confirm',
+      icon: Icons.call,
+    ),
+    const SizedBox(height: AppSpacing.md),
+    Container(
       width: double.infinity,
-      height: 54,
-      child: FilledButton.icon(
-        style: FilledButton.styleFrom(backgroundColor: MedilinkColors.red),
-        onPressed: _pendingAction == 'confirm'
-            ? null
-            : () => _action('confirm'),
-        icon: _pendingAction == 'confirm'
-            ? const SizedBox.square(
-                dimension: 20,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: Colors.white,
-                ),
-              )
-            : const Icon(Icons.call),
-        label: const Text('I NEED HELP'),
+      padding: const EdgeInsets.all(AppSpacing.sm),
+      decoration: BoxDecoration(
+        color: AppColors.danger.withValues(alpha: .08),
+        borderRadius: AppRadius.cardAll,
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.info_outline_rounded, size: 20, color: AppColors.danger),
+          const SizedBox(width: AppSpacing.xs),
+          Expanded(
+            child: Text(
+              'Caretakers are called/texted from this phone\'s own SIM — keep it on and connected.',
+              style: AppText.bodySm.copyWith(color: AppColors.dangerPressed, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
       ),
     ),
-    Padding(
-      padding: const EdgeInsets.only(top: 8),
-      child: Text(
-        'Caretakers are called/texted from this phone\'s own SIM — keep it on and connected.',
-        style: Theme.of(context).textTheme.bodySmall
-            ?.copyWith(color: MedilinkColors.amber),
-      ),
-    ),
-    if (message != null)
-      Padding(padding: const EdgeInsets.only(top: 16), child: Text(message!)),
+    if (message != null) _messageStrip(message!),
   ];
 
   /// The confirmation screen's outcome depends entirely on which status the emergency actually
@@ -2717,30 +2886,31 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
       ),
     };
     return [
-      Icon(icon, size: 82, color: color),
-      const SizedBox(height: 20),
+      icon == Icons.emergency
+          ? const AssetBadge(AppIcons.badgeEmergency, size: 112)
+          : IconBadge(icon: icon, tint: (color.withValues(alpha: .12), color), size: 96),
+      const SizedBox(height: AppSpacing.lg),
       Text(
         title,
         textAlign: TextAlign.center,
-        style: Theme.of(context).textTheme.headlineSmall
-            ?.copyWith(fontWeight: FontWeight.w900, color: color),
+        style: AppText.headline.copyWith(color: color, fontWeight: FontWeight.w800),
       ),
-      const SizedBox(height: 20),
+      const SizedBox(height: AppSpacing.lg),
       SectionCard(
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(AppSpacing.xs),
           child: Column(
             children: [
               Icon(
                 isSafe ? Icons.check_circle : Icons.info_outline,
                 color: isSafe ? MedilinkColors.teal : MedilinkColors.amber,
-                size: 40,
+                size: 28,
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: AppSpacing.xs),
               Text(
                 body,
                 textAlign: TextAlign.center,
-                style: const TextStyle(fontWeight: FontWeight.w700),
+                style: AppText.bodyStrong,
               ),
               // A closed event must say so plainly -- "Emergency resolved at 14:32:05" -- rather
               // than the screen just quietly reverting, which reads as if nothing happened.
@@ -2749,10 +2919,7 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
                 Text(
                   '${emergencyStatus == 'CANCELLED' ? 'Marked safe' : 'Emergency resolved'} at ${_formatClock(_resolvedAt ?? DateTime.now())}',
                   textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w800,
-                    color: MedilinkColors.teal,
-                  ),
+                  style: AppText.bodyStrong.copyWith(fontWeight: FontWeight.w800, color: AppColors.primary),
                 ),
               ],
               if (isSafe && _cooldownRemainingSeconds > 0) ...[
@@ -2785,19 +2952,20 @@ class _EmergencyPageState extends ConsumerState<EmergencyPage> {
           ),
         ),
       ),
-      const SizedBox(height: 12),
+      const SizedBox(height: AppSpacing.lg),
       // Still open on the backend (CONFIRMED/ACKNOWLEDGED/RESPONDING/HOSPITAL_ESCALATED) --
       // "Back to home" alone won't free up the next SOS, so offer the real close-out action.
       if (!isSafe)
-        FilledButton(
+        SafetyButton(
+          tone: SafetyTone.secondary,
+          icon: Icons.verified_user_outlined,
           onPressed: busy ? null : _endEmergency,
-          child: Text(
-            busy ? 'Ending emergency...' : "I'm safe now -- end emergency",
-          ),
+          label: busy ? 'Ending emergency...' : "I'm safe now -- end emergency",
         )
       else
         OutlinedButton(
           onPressed: _backToHome,
+          style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(56), shape: const StadiumBorder()),
           child: const Text('Back to home'),
         ),
     ];
@@ -3200,236 +3368,6 @@ class _HospitalsPageState extends ConsumerState<HospitalsPage> {
   );
 }
 
-class QrPage extends ConsumerStatefulWidget {
-  const QrPage({super.key});
-  @override
-  ConsumerState<QrPage> createState() => _QrPageState();
-}
-
-class _QrPageState extends ConsumerState<QrPage> {
-  String? token;
-  @override
-  Widget build(BuildContext context) => PageFrame(
-    title: 'QR center',
-    child: Center(
-      child: SectionCard(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                'MY PROFILE QR',
-                style: TextStyle(fontWeight: FontWeight.w900),
-              ),
-              const SizedBox(height: 16),
-              if (token != null)
-                QrImageView(data: token!, size: 180)
-              else
-                const Icon(
-                  Icons.qr_code_2,
-                  size: 160,
-                  color: MedilinkColors.blue,
-                ),
-              const SizedBox(height: 12),
-              OutlinedButton(
-                onPressed: _create,
-                child: const Text('Create profile QR'),
-              ),
-              if (_createError != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Text(
-                    _createError!,
-                    style: const TextStyle(color: MedilinkColors.red),
-                  ),
-                ),
-              const SizedBox(height: 12),
-              OutlinedButton.icon(
-                onPressed: () => Navigator.of(
-                  context,
-                ).push(MaterialPageRoute(builder: (_) => const QrScanPage())),
-                icon: const Icon(Icons.qr_code_scanner_outlined),
-                label: const Text('Scan someone\'s QR'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    ),
-  );
-  String? _createError;
-  Future<void> _create() async {
-    setState(() => _createError = null);
-    try {
-      final r = await ref
-          .read(apiClientProvider)
-          .post('/qr', body: {'purpose': 'PROFILE', 'expiresInMinutes': 15});
-      if (mounted) setState(() => token = (r as Map)['token']?.toString());
-    } catch (e) {
-      if (mounted)
-        setState(
-          () => _createError = 'Could not create a QR code. Check your connection and try again.',
-        );
-    }
-  }
-}
-
-class QrScanPage extends ConsumerStatefulWidget {
-  const QrScanPage({super.key});
-  @override
-  ConsumerState<QrScanPage> createState() => _QrScanPageState();
-}
-
-class _QrScanPageState extends ConsumerState<QrScanPage> {
-  bool _handled = false;
-  Map<String, dynamic>? _info;
-  String? _error;
-
-  Future<void> _onDetect(BarcodeCapture capture) async {
-    if (_handled || capture.barcodes.isEmpty) return;
-    final raw = capture.barcodes.first.rawValue;
-    if (raw == null) return;
-    setState(() => _handled = true);
-    try {
-      final result = await ref.read(apiClientProvider).get('/qr/$raw');
-      if (result is! Map) throw const FormatException('Unexpected response');
-      setState(() => _info = Map<String, dynamic>.from(result));
-    } on ApiException catch (e) {
-      setState(() {
-        _error = e.message;
-        _handled = false;
-      });
-    } catch (_) {
-      setState(() {
-        _error = 'Could not read that QR code. Try scanning again.';
-        _handled = false;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) => PageFrame(
-    title: 'Scan QR',
-    child: _info != null
-        ? _PatientInfoResult(info: _info!)
-        : Column(
-            children: [
-              if (_error != null)
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(
-                    _error!,
-                    style: const TextStyle(color: MedilinkColors.red),
-                  ),
-                ),
-              Expanded(child: MobileScanner(onDetect: _onDetect)),
-            ],
-          ),
-  );
-}
-
-class _PatientInfoResult extends StatelessWidget {
-  const _PatientInfoResult({required this.info});
-  final Map<String, dynamic> info;
-  @override
-  Widget build(BuildContext context) {
-    final patient = info['patient'] as Map?;
-    final contacts = (info['emergencyContacts'] as List?) ?? [];
-    final documents = (info['documentSummaries'] as List?) ?? [];
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        SectionCard(
-          child: ListTile(
-            leading: const CircleAvatar(child: Icon(Icons.person_outline)),
-            title: Text(patient?['name']?.toString() ?? 'Unknown patient'),
-            subtitle: Text(
-              [
-                if (patient?['age'] != null) 'Age ${patient!['age']}',
-                if (patient?['phone'] != null) patient!['phone'].toString(),
-              ].join(' · '),
-            ),
-          ),
-        ),
-        const SizedBox(height: 16),
-        Text(
-          'Emergency contacts',
-          style: Theme.of(context).textTheme.titleMedium
-              ?.copyWith(fontWeight: FontWeight.w800),
-        ),
-        const SizedBox(height: 8),
-        if (contacts.isEmpty)
-          const Text('No emergency contacts on file.')
-        else
-          ...contacts.map(
-            (c) => SectionCard(
-              child: ListTile(
-                leading: const Icon(Icons.phone_outlined),
-                title: Text(c['name']?.toString() ?? ''),
-                subtitle: Text(c['phone']?.toString() ?? ''),
-              ),
-            ),
-          ),
-        const SizedBox(height: 16),
-        Text(
-          'Document summaries',
-          style: Theme.of(context).textTheme.titleMedium
-              ?.copyWith(fontWeight: FontWeight.w800),
-        ),
-        const SizedBox(height: 8),
-        if (documents.isEmpty)
-          const Text('No AI-summarized documents on file.')
-        else
-          ...documents.map((d) {
-            final summary = d['summary'] as Map?;
-            final observations = (summary?['keyObservations'] as List?) ?? [];
-            final explanation =
-                summary?['simplifiedExplanation']?.toString() ?? '';
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: SectionCard(
-                child: Padding(
-                  padding: const EdgeInsets.all(4),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        d['filename']?.toString() ?? 'Document',
-                        style: const TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      if (observations.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Text(observations.join('\n')),
-                      ],
-                      if (explanation.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          explanation,
-                          style: const TextStyle(fontStyle: FontStyle.italic),
-                        ),
-                      ],
-                      if (summary?['disclaimer'] != null) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          summary!['disclaimer'].toString(),
-                          style: const TextStyle(
-                            color: Colors.blueGrey,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ),
-            );
-          }),
-      ],
-    );
-  }
-}
-
 class ConsentPage extends ConsumerStatefulWidget {
   const ConsentPage({super.key});
   @override
@@ -3467,7 +3405,9 @@ class _ConsentPageState extends ConsumerState<ConsentPage> {
     return consents;
   }
 
-  void _load() => setState(() => _future = _fetchConsents());
+  void _load() => setState(() {
+      _future = _fetchConsents();
+    });
 
   Future<void> _respond(String consentId, String action) async {
     setState(() => _busy = true);
@@ -3700,7 +3640,9 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     return contacts;
   }
 
-  void _load() => setState(() => _future = _fetchContacts());
+  void _load() => setState(() {
+      _future = _fetchContacts();
+    });
 
   @override
   Widget build(BuildContext context) {
@@ -3771,6 +3713,16 @@ class NotificationsPage extends ConsumerWidget {
     child: FutureBuilder<List<Map<String, dynamic>>>(
       future: ref.read(apiClientProvider).list('/notifications'),
       builder: (c, s) {
+        if (s.hasError) {
+          return FallbackView(
+            kind: fallbackKindFor(s.error.toString()),
+            message: fallbackKindFor(s.error.toString()) == FallbackKind.offline
+                ? null
+                : 'Your notifications could not be loaded right now.',
+            actionLabel: 'Go back',
+            onAction: () => Navigator.of(c).maybePop(),
+          );
+        }
         if (!s.hasData) return const LoadingState();
         if (s.data!.isEmpty)
           return const EmptyState(
@@ -3792,40 +3744,5 @@ class NotificationsPage extends ConsumerWidget {
 class ProfilePage extends ConsumerWidget {
   const ProfilePage({super.key});
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final user = ref.watch(sessionProvider).user ?? {};
-    return PageFrame(
-      title: 'Profile',
-      child: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          SectionCard(
-            child: ListTile(
-              leading: const CircleAvatar(child: Icon(Icons.person)),
-              title: Text(user['name']?.toString() ?? 'MEDILINK user'),
-              subtitle: Text('MEDILINK ID: ${user['id'] ?? ''}'),
-            ),
-          ),
-          const SizedBox(height: 16),
-          SectionCard(
-            child: SwitchListTile(
-              value: ref.watch(sessionProvider).seniorMode,
-              onChanged: (v) =>
-                  ref.read(sessionProvider.notifier).setSeniorMode(v),
-              title: const Text('Senior Mode'),
-            ),
-          ),
-          const SizedBox(height: 20),
-          OutlinedButton.icon(
-            onPressed: () async {
-              await ref.read(sessionProvider.notifier).clear();
-              if (context.mounted) context.go('/welcome');
-            },
-            icon: const Icon(Icons.logout),
-            label: const Text('Logout'),
-          ),
-        ],
-      ),
-    );
-  }
+  Widget build(BuildContext context, WidgetRef ref) => const ProfileBody();
 }
