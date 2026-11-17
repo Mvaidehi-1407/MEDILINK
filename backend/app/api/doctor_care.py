@@ -12,7 +12,7 @@ from app.api.consultations import ACTIVE_EMERGENCY, _linked_patient_ids, _patien
 from app.auth.security import hash_password, verify_password
 from app.dependencies import db, get_current_user
 from app.repositories.base import MongoRepository
-from app.services.doctor_access import audit, aware, is_linked, notify
+from app.services.doctor_access import ack_fields, audit, aware, current_acks, is_linked, notify
 from app.utils.mongo import object_id
 from app.utils.time import utcnow
 
@@ -95,11 +95,11 @@ def _alert_level(e: dict) -> str:
 async def alerts(user: dict = Depends(as_doctor), database: AsyncIOMotorDatabase = Depends(db)):
     linked = await _linked_patient_ids(database, user["id"])
     rows = await MongoRepository(database, "emergencies").list({"patientId": {"$in": linked}}, limit=50, sort=[("createdAt", -1)])
-    acks = {a["emergencyId"] for a in await MongoRepository(database, "alert_acks").list({"doctorId": user["id"], "emergencyId": {"$in": [r["id"] for r in rows]}}, limit=100)}
+    acks = await current_acks(database, user["id"], rows)
     cards = {pid: await _patient_card(database, pid, with_age=False) for pid in {r["patientId"] for r in rows}}
     return [{"id": r["id"], "status": r["status"], "level": _alert_level(r), "active": r["status"] in ACTIVE_EMERGENCY,
              "createdAt": r["createdAt"], "trigger": r.get("trigger"), "reading": _reading(r["reading"]) if (r.get("reading") or {}).get("timestamp") else None,
-             "acknowledged": r["id"] in acks, "patient": cards[r["patientId"]]} for r in rows]
+             **ack_fields(acks.get(r["id"])), "patient": cards[r["patientId"]]} for r in rows]
 
 
 @router.get("/alerts/{alert_id}")
@@ -109,7 +109,7 @@ async def alert_detail(alert_id: str, user: dict = Depends(as_doctor), database:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
     await _require_link(database, user, e["patientId"], "view_alert")
     hospitals = e.get("nearbyHospitals") or []
-    ack = await database.alert_acks.find_one({"doctorId": user["id"], "emergencyId": alert_id})
+    ack = (await current_acks(database, user["id"], [e])).get(e["id"])
     return {
         "id": e["id"], "status": e["status"], "level": _alert_level(e), "active": e["status"] in ACTIVE_EMERGENCY,
         "createdAt": e["createdAt"], "resolvedAt": e.get("resolvedAt"),
@@ -124,20 +124,22 @@ async def alert_detail(alert_id: str, user: dict = Depends(as_doctor), database:
                      "nearby": [{"name": h.get("name"), "distanceMeters": h.get("distanceMeters")} for h in hospitals[:3]]},
         # Ambulance dispatch isn't integrated: only the escalation stage is stored.
         "ambulance": "REQUESTED" if e.get("escalationStage") == "AMBULANCE_REQUESTED" else None,
-        "acknowledgedAt": ack["at"] if ack else None,
+        **ack_fields(ack),
         "patient": await _patient_card(database, e["patientId"], with_age=True),
     }
 
 
 @router.post("/alerts/{alert_id}/acknowledge")
 async def acknowledge(alert_id: str, user: dict = Depends(as_doctor), database: AsyncIOMotorDatabase = Depends(db)):
-    """Records that this doctor saw the alert. Never writes to the emergency record."""
-    e = await database.emergencies.find_one({"_id": object_id(alert_id)}, {"patientId": 1})
+    """Records that this doctor saw the alert at its current status (a later status change brings
+    the alert back). Never writes to the emergency record, so the SOS flow is unaffected."""
+    e = await database.emergencies.find_one({"_id": object_id(alert_id)}, {"patientId": 1, "status": 1})
     if not e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
     await _require_link(database, user, e["patientId"], "acknowledge_alert")
-    await database.alert_acks.update_one({"doctorId": user["id"], "emergencyId": alert_id}, {"$setOnInsert": {"at": utcnow()}}, upsert=True)
-    return {"acknowledged": True}
+    now = utcnow()
+    await database.alert_acks.update_one({"doctorId": user["id"], "emergencyId": alert_id}, {"$set": {"at": now, "status": e.get("status")}}, upsert=True)
+    return {"acknowledged": True, "acknowledgedAt": now, "acknowledgedBy": user["id"], "status": e.get("status")}
 
 
 # ---- consultation notes --------------------------------------------------------------------------

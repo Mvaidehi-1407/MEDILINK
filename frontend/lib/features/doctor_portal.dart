@@ -250,6 +250,19 @@ final doctorHomeProvider = FutureProvider.autoDispose<Map<String, dynamic>>(
   (ref) async => Map<String, dynamic>.from(await ref.read(apiClientProvider).get('/doctor/home') as Map),
 );
 
+/// Alerts acknowledged on this device ("id:status"), hidden at once while /doctor/home reloads.
+/// The server keeps the acknowledgement, so it survives restarts; a status change shows it again.
+final acknowledgedAlertsProvider = NotifierProvider<AcknowledgedAlerts, Set<String>>(AcknowledgedAlerts.new);
+
+class AcknowledgedAlerts extends Notifier<Set<String>> {
+  @override
+  Set<String> build() {
+    ref.watch(sessionProvider.select((s) => s.userId)); // cleared when another account signs in
+    return const {};
+  }
+  void add(String id, Object? status) => state = {...state, '$id:$status'};
+}
+
 final doctorProfileProvider = FutureProvider.autoDispose<Map<String, dynamic>>(
   (ref) async => Map<String, dynamic>.from(await ref.read(apiClientProvider).get('/doctor/profile') as Map),
 );
@@ -335,7 +348,10 @@ class CriticalAlertBanner extends ConsumerWidget {
   const CriticalAlertBanner({super.key});
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final alerts = (ref.watch(doctorHomeProvider).value?['alerts'] as List?) ?? const [];
+    final local = ref.watch(acknowledgedAlertsProvider);
+    final alerts = ((ref.watch(doctorHomeProvider).value?['alerts'] as List?) ?? const [])
+        .where((a) => a['acknowledged'] != true && !local.contains('${a['id']}:${a['status']}'))
+        .toList();
     if (alerts.isEmpty) return const SizedBox.shrink();
     final first = Map<String, dynamic>.from(alerts.first as Map);
     final name = (first['patient'] as Map?)?['name'] ?? 'A patient';

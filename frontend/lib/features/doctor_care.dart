@@ -526,10 +526,18 @@ class _AlertDetailPageState extends ConsumerState<AlertDetailPage> {
   Future<void> _ack() async {
     setState(() => _acking = true);
     try {
-      await ref.read(apiClientProvider).post('/doctor/alerts/${widget.alertId}/acknowledge');
+      final r = await ref.read(apiClientProvider).post('/doctor/alerts/${widget.alertId}/acknowledge') as Map;
+      // Hide this alert's banner everywhere right away; the server copy keeps it hidden.
+      ref.read(acknowledgedAlertsProvider.notifier).add(widget.alertId, r['status']);
+      ref.invalidate(doctorHomeProvider);
       _reload();
     } on ApiException catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      // Banner stays; short error.
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(e.statusCode == null ? "Couldn't acknowledge. Check your connection and try again." : "Couldn't acknowledge: ${e.message}"),
+        ));
+      }
     } finally {
       if (mounted) setState(() => _acking = false);
     }

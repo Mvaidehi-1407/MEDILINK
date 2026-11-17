@@ -310,3 +310,60 @@ def test_patient_follow_ups_hide_doctor_notes(env):
     rows = as_("pat").get("/api/consultations/follow-ups").json()
     assert rows and rows[0]["title"] == "BP check" and "notes" not in rows[0] and "private thought" not in str(rows)
     assert as_("doc").get("/api/consultations/follow-ups").status_code == 403
+
+
+# ---- Emergency acknowledge banner + QR summary screen -------------------------------------------
+def _connect_patient(as_, people, key):
+    req = as_(key).post("/api/consultations", json={"doctorId": people["doc"]["id"], "reason": "Check-up please"}).json()
+    as_("doc").post(f"/api/doctor/requests/{req['id']}/accept")
+
+
+def test_acknowledge_hides_only_that_alert_until_status_changes(env):
+    as_, people, database = env
+    _connect_patient(as_, people, "pat")
+    _connect_patient(as_, people, "other")
+    e1 = str(run(database.emergencies.insert_one({"patientId": people["pat"]["id"], "status": "VERIFICATION", "createdAt": utcnow(), "timeline": []})).inserted_id)
+    e2 = str(run(database.emergencies.insert_one({"patientId": people["other"]["id"], "status": "CONFIRMED", "createdAt": utcnow(), "timeline": []})).inserted_id)
+    before = run(database.emergencies.find_one({"_id": ObjectId(e1)}))
+    r = as_("doc").post(f"/api/doctor/alerts/{e1}/acknowledge").json()
+    assert r["acknowledged"] and r["acknowledgedBy"] == people["doc"]["id"] and r["acknowledgedAt"]
+    assert run(database.emergencies.find_one({"_id": ObjectId(e1)})) == before  # SOS record untouched
+
+    def home_acks():
+        return {a["id"]: a["acknowledged"] for a in as_("doc").get("/api/doctor/home").json()["alerts"]}
+    assert home_acks() == {e1: True, e2: False}  # the other patient's banner stays
+    assert home_acks() == {e1: True, e2: False}  # persists across reloads (server-side)
+    listed = {a["id"]: a for a in as_("doc").get("/api/doctor/alerts").json()}
+    assert listed[e1]["acknowledged"] and listed[e1]["acknowledgedBy"] == people["doc"]["id"] and not listed[e2]["acknowledged"]
+    # Status change brings it back.
+    run(database.emergencies.update_one({"_id": ObjectId(e1)}, {"$set": {"status": "CONFIRMED"}}))
+    assert home_acks()[e1] is False
+    assert as_("doc").get(f"/api/doctor/alerts/{e1}").json()["acknowledgedAt"] is None
+    # Unlinked doctor can't acknowledge; nothing recorded.
+    assert as_("doc2").post(f"/api/doctor/alerts/{e2}/acknowledge").status_code == 403
+    assert run(database.alert_acks.count_documents({"doctorId": people["doc2"]["id"]})) == 0
+
+
+def test_qr_summary_has_profile_and_summary_fields_and_blocks_without_consent(env):
+    as_, people, database = env
+    pid = people["pat"]["id"]
+    run(database.health_readings.insert_one({"patientId": pid, "heartRate": 128, "spo2": 93, "timestamp": utcnow(), "risk": {"riskLevel": "WARNING", "riskScore": 0.61}}))
+    run(database.medical_records.insert_one({"patientId": pid, "filename": "cbc.pdf", "createdAt": utcnow(),
+                                              "aiSummary": {"status": "READY", "summary": {"documentType": "Blood test", "keyFindings": ["Low haemoglobin"]}}}))
+    run(database.emergencies.insert_one({"patientId": pid, "status": "RESOLVED", "createdAt": utcnow(), "timeline": []}))
+    # No consent and no QR: blocked, nothing leaks.
+    blocked = as_("doc").get(f"/api/doctor/patients/{pid}/summary")
+    assert blocked.status_code == 403 and "Test pat" not in blocked.text
+    share = as_("pat").post("/api/qr/share").json()
+    assert as_("doc").post("/api/doctor/qr/redeem", json={"token": share["url"]}).status_code == 200
+    s = as_("doc").get(f"/api/doctor/patients/{pid}/summary").json()
+    assert s["patient"]["medilinkId"] == f"ML-{pid[-8:].upper()}" and s["patient"]["phone"] and s["patient"]["age"] == 40
+    assert s["risk"]["riskLevel"] == "WARNING" and s["latest"]["heartRate"] == 128
+    assert s["reportSummary"]["keyFindings"] == ["Low haemoglobin"] and s["reportSummary"]["disclaimer"]
+    assert [e["status"] for e in s["recentEmergencies"]] == ["RESOLVED"]
+    assert s["caretakers"] is None  # QR-only access never shows caretakers
+    # The second patient's data is not reachable with the first patient's QR.
+    assert as_("doc").get(f"/api/doctor/patients/{people['other']['id']}/summary").status_code == 403
+    # Expired QR is refused.
+    run(database.qr_shares.update_one({"jti": share["id"]}, {"$set": {"expiresAt": utcnow() - timedelta(minutes=1)}}))
+    assert as_("doc2").post("/api/doctor/qr/redeem", json={"token": share["token"]}).status_code == 410

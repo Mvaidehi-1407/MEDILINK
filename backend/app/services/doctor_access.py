@@ -78,6 +78,19 @@ async def assert_doctor_can_read(database: AsyncIOMotorDatabase, user: dict, pat
     await audit(database, user, patient_id, action)
 
 
+async def current_acks(database: AsyncIOMotorDatabase, doctor_id: str, emergencies: list[dict]) -> dict[str, dict]:
+    """This doctor's acknowledgements that still apply: an ack made while the emergency had the same
+    status. A status change brings the alert back. Acks live in alert_acks; the emergency record
+    (and so the SOS flow) is never written."""
+    acks = await database.alert_acks.find({"doctorId": doctor_id, "emergencyId": {"$in": [e["id"] for e in emergencies]}}).to_list(None)
+    status_of = {e["id"]: e.get("status") for e in emergencies}
+    return {a["emergencyId"]: a for a in acks if a.get("status") in (None, status_of.get(a["emergencyId"]))}
+
+
+def ack_fields(ack: dict | None) -> dict:
+    return {"acknowledged": bool(ack), "acknowledgedAt": ack["at"] if ack else None, "acknowledgedBy": ack["doctorId"] if ack else None}
+
+
 async def notify(database: AsyncIOMotorDatabase, user_id: str, title: str, body: str, data: dict) -> None:
     """In-app notification row only (no push provider)."""
     await database.notifications.insert_one({"userId": user_id, "title": title, "body": body, "data": data, "read": False, "createdAt": utcnow()})

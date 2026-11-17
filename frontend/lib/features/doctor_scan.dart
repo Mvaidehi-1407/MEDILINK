@@ -27,14 +27,14 @@ class _DoctorScannerPageState extends ConsumerState<DoctorScannerPage> {
   final _camera = MobileScannerController(detectionSpeed: DetectionSpeed.noDuplicates);
   bool _busy = false;
   bool _torch = false;
-  String? _error;
+  int? _errorStatus; // 0 = offline
 
   Future<void> _onDetect(BarcodeCapture capture) async {
     final raw = capture.barcodes.isEmpty ? null : capture.barcodes.first.rawValue;
     if (_busy || raw == null) return;
     setState(() {
       _busy = true;
-      _error = null;
+      _errorStatus = null;
     });
     try {
       final res = Map<String, dynamic>.from(await ref.read(apiClientProvider).post('/doctor/qr/redeem', body: {'token': raw}) as Map);
@@ -43,7 +43,7 @@ class _DoctorScannerPageState extends ConsumerState<DoctorScannerPage> {
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => PatientSummaryPage(patientId: res['patientId'].toString())));
     } on ApiException catch (e) {
-      if (mounted) setState(() => _error = e.statusCode == 410 || e.statusCode == 422 ? e.message : 'This QR code could not be checked. ${e.message}');
+      if (mounted) setState(() => _errorStatus = e.statusCode ?? 0);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -100,18 +100,24 @@ class _DoctorScannerPageState extends ConsumerState<DoctorScannerPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                if (_error != null) ...[
+                if (_errorStatus != null)
                   Semantics(
                     liveRegion: true,
-                    child: Container(
-                      padding: const EdgeInsets.all(AppSpacing.sm),
-                      decoration: BoxDecoration(color: AppColors.dangerTint, borderRadius: AppRadius.inputAll),
-                      child: Text(_error!, style: AppText.bodySm.copyWith(color: AppColors.dangerPressed, fontWeight: FontWeight.w600)),
+                    child: FallbackView(
+                      compact: true,
+                      kind: switch (_errorStatus) { 0 => FallbackKind.offline, 403 => FallbackKind.permission, 410 || 422 || 404 => FallbackKind.notFound, _ => FallbackKind.error },
+                      title: switch (_errorStatus) { 0 => null, 403 => 'No consent', 410 || 422 || 404 => 'QR code expired or invalid', _ => "Couldn't check this QR code" },
+                      message: switch (_errorStatus) {
+                        0 => null,
+                        403 => "This patient hasn't given you access. Ask them to share their MediLink QR code from their app.",
+                        410 || 422 || 404 => 'Ask the patient to open MediLink and show a new QR code.',
+                        _ => 'Please try scanning again.',
+                      },
+                      actionLabel: 'Scan again',
+                      onAction: () => setState(() => _errorStatus = null),
                     ),
-                  ),
-                  const SizedBox(height: AppSpacing.xs),
-                  TextButton(onPressed: () => setState(() => _error = null), child: const Text('Scan again')),
-                ] else
+                  )
+                else
                   Text("Point the camera at the QR code on the patient's MediLink app.", textAlign: TextAlign.center, style: AppText.body),
                 const SizedBox(height: AppSpacing.sm),
                 OutlinedButton.icon(
@@ -186,19 +192,29 @@ class _PatientSummaryPageState extends ConsumerState<PatientSummaryPage> {
         return page(const Padding(padding: EdgeInsets.all(AppSpacing.gutter), child: SkeletonList(rows: 4)));
       }
       final err = snap.error;
-      if (err is ApiException && err.statusCode == 403) return page(patientUnavailable(context, err.message));
-      if (err != null) return page(ErrorState(message: err.toString(), onRetry: _reload));
+      if (err is ApiException && err.statusCode == 403) {
+        return page(patientUnavailable(context, "This patient hasn't given you access. Ask them to show their MediLink QR code or accept your consultation."));
+      }
+      if (err != null) {
+        final kind = err is ApiException && err.statusCode == null ? FallbackKind.offline : FallbackKind.error;
+        return page(FallbackView(
+          kind: kind,
+          message: kind == FallbackKind.offline ? null : "This patient's summary couldn't be loaded right now.",
+          actionLabel: 'Try again',
+          onAction: _reload,
+        ));
+      }
       final s = snap.data!;
       final p = Map<String, dynamic>.from(s['patient'] as Map);
       if (s['connected'] != true || widget.summaryOnly) {
-        return page(_scroll([_header(s, p), ..._overview(s, withCaretakers: false), ..._health(s, withReports: false)]));
+        return page(_scroll([_header(s, p), _qrLinks(s, p), ..._qrSummary(s), ..._overview(s, withCaretakers: false), ..._health(s, withReports: false)]));
       }
       return DefaultTabController(
         length: 3,
         child: page(
           TabBarView(children: [
             _scroll([_header(s, p), _actions(s, p), ..._overview(s, withCaretakers: true)]),
-            _scroll(_health(s, withReports: true)),
+            _scroll([..._qrSummary(s), ..._health(s, withReports: true)]),
             _History(patient: p, consultations: (s['consultations'] as List? ?? []).cast<Map>()),
           ]),
           bottom: const TabBar(tabs: [Tab(text: 'Overview'), Tab(text: 'Health'), Tab(text: 'History')]),
@@ -219,7 +235,8 @@ class _PatientSummaryPageState extends ConsumerState<PatientSummaryPage> {
       Expanded(
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(p['name']?.toString() ?? 'Patient', style: AppText.title, maxLines: 2, overflow: TextOverflow.ellipsis),
-          Text([pidOf(p['id']), if (p['age'] != null) 'Age ${p['age']}'].join(' · '), style: AppText.bodySm),
+          Text([p['medilinkId'] ?? pidOf(p['id']), if (p['age'] != null) 'Age ${p['age']}'].join(' · '), style: AppText.bodySm),
+          if ((p['phone'] ?? '').toString().isNotEmpty) Text(p['phone'].toString(), style: AppText.bodySm),
           const SizedBox(height: AppSpacing.xxs),
           s['connected'] == true
               ? const StatusPill(label: 'Connected', color: AppColors.success)
@@ -228,6 +245,89 @@ class _PatientSummaryPageState extends ConsumerState<PatientSummaryPage> {
       ),
     ]),
   );
+
+  /// QR screen links: full patient page and message. Both need an accepted consultation; a QR-only
+  /// doctor sees why instead of a dead button.
+  Widget _qrLinks(Map<String, dynamic> s, Map<String, dynamic> p) {
+    final connected = s['connected'] == true;
+    final shape = OutlinedButton.styleFrom(minimumSize: const Size(0, 48), shape: const StadiumBorder());
+    return Padding(
+      padding: const EdgeInsets.only(top: AppSpacing.md),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              style: shape,
+              onPressed: connected ? () => pushPage(context, PatientSummaryPage(patientId: p['id'].toString())) : null,
+              icon: const Icon(Icons.person_outline_rounded, size: 18),
+              label: const Text('Full profile'),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.xs),
+          Expanded(
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(minimumSize: const Size(0, 48), shape: const StadiumBorder()),
+              onPressed: connected ? () => pushPage(context, DoctorChatPage(conversationId: s['conversationId'].toString(), patient: p)) : null,
+              icon: const Icon(Icons.chat_bubble_outline_rounded, size: 18),
+              label: const Text('Message'),
+            ),
+          ),
+        ]),
+        if (!connected)
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.xs),
+            child: Text('The full page and messaging open once this patient sends you a consultation request and you accept it.', style: AppText.bodySm),
+          ),
+      ]),
+    );
+  }
+
+  /// Risk level, newest AI report summary and recent emergencies (stored records only).
+  List<Widget> _qrSummary(Map<String, dynamic> s) {
+    final risk = s['risk'] as Map?;
+    final report = s['reportSummary'] as Map?;
+    final emergencies = (s['recentEmergencies'] as List? ?? []).cast<Map>();
+    final findings = (report?['keyFindings'] as List? ?? const []);
+    return [
+      const SectionHeader('Risk level'),
+      SectionCard(
+        child: risk == null
+            ? Text('No risk assessment recorded yet.', style: AppText.body)
+            : Row(children: [
+                StatusPill(label: riskStyle(risk['riskLevel']).$1, color: riskStyle(risk['riskLevel']).$2),
+                const SizedBox(width: AppSpacing.sm),
+                Expanded(child: Text('From the reading on ${formatTimestamp(risk['timestamp'])}', style: AppText.bodySm)),
+              ]),
+      ),
+      const SectionHeader('Latest report summary'),
+      SectionCard(
+        child: report == null
+            ? Text('No AI report summary yet.', style: AppText.body)
+            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(report['filename']?.toString() ?? 'Report', style: AppText.bodyStrong, maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text([report['documentType'], report['date'] ?? formatTimestamp(report['createdAt']).split(',').first].whereType<Object>().join(' · '), style: AppText.bodySm),
+                for (final f in findings) Padding(padding: const EdgeInsets.only(top: 4), child: Text('• $f', style: AppText.body)),
+                const SizedBox(height: AppSpacing.xs),
+                Text(report['disclaimer']?.toString() ?? '', style: AppText.caption),
+              ]),
+      ),
+      const SectionHeader('Recent emergencies'),
+      SectionCard(
+        padding: emergencies.isEmpty ? const EdgeInsets.all(AppSpacing.md) : EdgeInsets.zero,
+        child: emergencies.isEmpty
+            ? Text('No emergencies recorded.', style: AppText.body)
+            : Column(children: [
+                for (final e in emergencies)
+                  ListTile(
+                    leading: Icon(e['status'] == 'RESOLVED' || e['status'] == 'CANCELLED' ? Icons.check_circle_outline_rounded : Icons.warning_amber_rounded,
+                        color: e['status'] == 'RESOLVED' || e['status'] == 'CANCELLED' ? AppColors.success : AppColors.danger),
+                    title: Text(e['status'].toString().replaceAll('_', ' ').toLowerCase().replaceFirstMapped(RegExp(r'^.'), (m) => m[0]!.toUpperCase()), style: AppText.bodyStrong),
+                    subtitle: Text(formatTimestamp(e['createdAt']), style: AppText.bodySm),
+                  ),
+              ]),
+      ),
+    ];
+  }
 
   Widget _actions(Map<String, dynamic> s, Map<String, dynamic> p) {
     Widget action(IconData icon, String label, VoidCallback onTap, {bool primary = false}) => primary

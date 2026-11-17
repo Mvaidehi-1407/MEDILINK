@@ -14,9 +14,10 @@ from app.models.enums import ConsentStatus, EmergencyStatus, UserRole
 from app.repositories.base import MongoRepository
 from app.schemas.auth import SPECIALIZATIONS
 from app.services.doctor_access import (
-    DECLINE_COOLDOWN, REQUEST_EXPIRY, audit, aware, display_status,
+    DECLINE_COOLDOWN, REQUEST_EXPIRY, ack_fields, audit, aware, current_acks, display_status,
     accepting, has_qr_grant, is_linked, notify, pair_id, public_doctor,
 )
+from app.services.document_summary import DISCLAIMER
 from app.utils.mongo import object_id
 from app.utils.time import utcnow
 from app.websocket.manager import manager
@@ -217,6 +218,7 @@ async def home(user: dict = Depends(as_doctor), database: AsyncIOMotorDatabase =
     monitoring = len(await database.health_readings.distinct("patientId", {"patientId": {"$in": linked}, "timestamp": {"$gte": since}}))
     recent_requests = await MongoRepository(database, "consents").list(pending_q, limit=3, sort=[("createdAt", -1)])
     recent_messages = await MongoRepository(database, "messages").list({"receiverId": me}, limit=3, sort=[("timestamp", -1)])
+    acks = await current_acks(database, me, alerts)
     names = {}
     for pid in {*linked, *(r["patientId"] for r in recent_requests), *(m["senderId"] for m in recent_messages)}:
         names[pid] = await _patient_card(database, pid, with_age=False)
@@ -235,7 +237,8 @@ async def home(user: dict = Depends(as_doctor), database: AsyncIOMotorDatabase =
         "recentRequests": [_request_out(r, names[r["patientId"]]) for r in recent_requests],
         "recentMessages": [{"id": m["id"], "message": m.get("message") or "Attachment", "timestamp": m["timestamp"], "conversationId": m["conversationId"],
                             "readStatus": m.get("readStatus"), "patient": names.get(m["senderId"])} for m in recent_messages],
-        "alerts": [{"id": a["id"], "status": a["status"], "createdAt": a["createdAt"], "trigger": a.get("trigger"), "patient": names.get(a["patientId"])} for a in alerts],
+        "alerts": [{"id": a["id"], "status": a["status"], "createdAt": a["createdAt"], "trigger": a.get("trigger"), "patient": names.get(a["patientId"]),
+                    **ack_fields(acks.get(a["id"]))} for a in alerts],
     }
 
 
@@ -342,8 +345,18 @@ async def patient_summary(patient_id: str, user: dict = Depends(as_doctor), data
     live = bool(latest) and aware(latest["timestamp"]) > utcnow() - timedelta(minutes=5)
     cid = pair_id(patient_id, user["id"])
     grant = None if connected else await database.qr_access_grants.find_one({"doctorId": user["id"], "patientId": patient_id}, sort=[("expiresAt", -1)])
+    # QR screen extras (additive): identity, risk, newest AI report summary, recent emergencies.
+    patient_user = await MongoRepository(database, "users").get(patient_id) or {}
+    report = await database.medical_records.find_one({"patientId": patient_id, "aiSummary.status": "READY"}, sort=[("createdAt", -1)])
+    rs = ((report or {}).get("aiSummary") or {}).get("summary") or {}
+    emergencies = await MongoRepository(database, "emergencies").list({"patientId": patient_id}, limit=5, sort=[("createdAt", -1)])
+    risk = (latest or {}).get("risk") or {}
     return {
-        "patient": await _patient_card(database, patient_id, with_age=True),
+        "patient": await _patient_card(database, patient_id, with_age=True) | {"medilinkId": f"ML-{patient_id[-8:].upper()}", "phone": patient_user.get("phone")},
+        "risk": {"riskLevel": risk.get("riskLevel"), "riskScore": risk.get("riskScore"), "timestamp": latest["timestamp"]} if risk else None,
+        "reportSummary": {"filename": report.get("filename"), "createdAt": report.get("createdAt"), "documentType": rs.get("documentType"),
+                          "date": rs.get("date"), "keyFindings": (rs.get("keyFindings") or [])[:5], "disclaimer": DISCLAIMER} if report and not rs.get("unreadable") else None,
+        "recentEmergencies": [{"id": e["id"], "status": e["status"], "createdAt": e["createdAt"], "trigger": e.get("trigger")} for e in emergencies],
         "connected": connected,
         "qrExpiresAt": grant["expiresAt"] if grant else None,
         "conversationId": cid if connected else None,
