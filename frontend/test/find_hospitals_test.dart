@@ -161,7 +161,7 @@ void main() {
         }
         return http.Response(jsonEncode({'elements': []}), 200);
       });
-      final result = await fetchNearbyHospitals(_centre, 5000, client: mock);
+      final result = await fetchOverpassHospitals(_centre, 5000, client: mock);
       expect(result, isEmpty);
       // Stops at the third mirror rather than continuing to try every configured one -- a
       // mirror that actually answers must end the search immediately.
@@ -177,9 +177,84 @@ void main() {
       // Connectivity checking hits a real platform channel that isn't wired up in a plain unit
       // test, so only the retry loop itself (which runs entirely before that check) is asserted
       // here; whatever exception surfaces afterwards is not the point of this test.
-      await fetchNearbyHospitals(_centre, 5000, client: mock).catchError((_) => const <Hospital>[]);
+      await fetchOverpassHospitals(_centre, 5000, client: mock).catchError((_) => const <Hospital>[]);
       expect(calledUrls, hasLength(4));
       expect(calledUrls.toSet(), hasLength(4)); // four distinct hosts, never the same one twice
+    });
+
+    test('identifies the app: Dart\'s default User-Agent gets a 406 from overpass-api.de', () async {
+      final agents = <String?>[];
+      final mock = MockClient((request) async {
+        agents.add(request.headers['User-Agent'] ?? request.headers['user-agent']);
+        return http.Response(jsonEncode({'elements': []}), 200);
+      });
+      await fetchOverpassHospitals(_centre, 5000, client: mock);
+      expect(agents.single, startsWith('MediLink/'));
+    });
+  });
+
+  group('fetchNearbyHospitals: Nominatim first, Overpass fallback', () {
+    Map<String, dynamic> place(String name, double lat, double lon, {int id = 1}) => {
+          'osm_type': 'node', 'osm_id': id, 'name': name, 'lat': '$lat', 'lon': '$lon',
+          'address': {'road': 'MG Road', 'city': 'Hyderabad', 'postcode': '500001'},
+          'extratags': {'phone': '+91 40 1234', 'emergency': 'yes'},
+        };
+
+    test('uses Nominatim results, nearest first, inside the radius only, without calling Overpass', () async {
+      final hosts = <String>[];
+      final mock = MockClient((request) async {
+        hosts.add(request.url.host);
+        expect(request.headers['User-Agent'], startsWith('MediLink/'));
+        return http.Response(jsonEncode([
+          place('Far', 17.42, 78.4867, id: 1), // ~3.9 km
+          place('Near', 17.386, 78.4867, id: 2), // ~110 m
+          place('Outside the circle', 17.43, 78.53, id: 3), // in the box's corner, >5 km
+        ]), 200);
+      });
+      final result = await fetchNearbyHospitals(_centre, 5000, client: mock);
+      expect(result.map((h) => h.name), ['Near', 'Far']);
+      expect(result.first.address, 'MG Road, Hyderabad, 500001');
+      expect(result.first.phone, '+91 40 1234');
+      expect(result.first.emergency, isTrue);
+      expect(hosts, ['nominatim.openstreetmap.org']);
+    });
+
+    test('falls back to the Overpass chain when Nominatim fails', () async {
+      final hosts = <String>[];
+      final mock = MockClient((request) async {
+        hosts.add(request.url.host);
+        if (request.url.host == 'nominatim.openstreetmap.org') return http.Response('<html>busy</html>', 503);
+        return http.Response(jsonEncode({'elements': [
+          {'type': 'node', 'id': 7, 'lat': 17.386, 'lon': 78.4867, 'tags': {'name': 'From Overpass'}},
+        ]}), 200);
+      });
+      final result = await fetchNearbyHospitals(_centre, 5000, client: mock);
+      expect(result.single.name, 'From Overpass');
+      expect(hosts, ['nominatim.openstreetmap.org', 'overpass-api.de']);
+    });
+
+    test('an empty Nominatim answer is a real "no hospitals", not a failure', () async {
+      final hosts = <String>[];
+      final mock = MockClient((request) async {
+        hosts.add(request.url.host);
+        return http.Response('[]', 200);
+      });
+      expect(await fetchNearbyHospitals(_centre, 5000, client: mock), isEmpty);
+      expect(hosts, ['nominatim.openstreetmap.org']);
+    });
+
+    test('a capped (50-result) wide search also merges a 2 km search so the closest is not lost', () async {
+      final viewboxes = <String>[];
+      final mock = MockClient((request) async {
+        viewboxes.add(request.url.queryParameters['viewbox']!);
+        if (viewboxes.length == 1) {
+          return http.Response(jsonEncode([for (var i = 0; i < 50; i++) place('Big $i', 17.42, 78.4867, id: 100 + i)]), 200);
+        }
+        return http.Response(jsonEncode([place('Small clinic hospital', 17.3855, 78.4867, id: 9)]), 200);
+      });
+      final result = await fetchNearbyHospitals(_centre, 10000, client: mock);
+      expect(viewboxes, hasLength(2));
+      expect(result.first.name, 'Small clinic hospital');
     });
   });
 

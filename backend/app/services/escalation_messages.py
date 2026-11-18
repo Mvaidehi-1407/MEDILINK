@@ -10,12 +10,20 @@ def _vitals_snapshot(reading: Optional[Dict[str, Any]]) -> str:
     return f"HR {reading.get('heartRate', '--')}, SpO2 {reading.get('spo2', '--')}%"
 
 
+def _maps_link(latitude: Any, longitude: Any) -> Optional[str]:
+    """Tappable Google Maps link for real coordinates only; None when either is missing."""
+    if latitude is None or longitude is None:
+        return None
+    return f"https://maps.google.com/?q={latitude},{longitude}"
+
+
 def _hospital_line(nearest_hospital: Optional[Dict[str, Any]]) -> str:
     if not nearest_hospital:
         return "not available"
     name = nearest_hospital.get("name") or "Unnamed hospital"
     address = nearest_hospital.get("address") or "address unavailable"
-    return f"{name} -- {address}"
+    link = _maps_link(nearest_hospital.get("latitude"), nearest_hospital.get("longitude"))
+    return f"{name} -- {address}" + (f" -- {link}" if link else "")
 
 
 def _location_line(emergency: Dict[str, Any]) -> str:
@@ -27,7 +35,7 @@ def _location_line(emergency: Dict[str, Any]) -> str:
     longitude, latitude = coords[0], coords[1]
     if latitude is None or longitude is None:
         return "not yet available"
-    return f"{latitude}, {longitude}" + (f" -- {address}" if address else "")
+    return f"{latitude}, {longitude}" + (f" -- {address}" if address else "") + f" -- {_maps_link(latitude, longitude)}"
 
 
 def contact_alert_message(patient: Dict[str, Any], emergency: Dict[str, Any], nearest_hospital: Optional[Dict[str, Any]] = None) -> str:

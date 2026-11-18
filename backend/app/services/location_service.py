@@ -9,6 +9,11 @@ from app.repositories.base import MongoRepository
 from app.utils.mongo import serialize_doc
 
 _OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# OSM services reject generic client User-Agents (overpass-api.de answers 406 to them) and their
+# usage policies ask for an identifying one. No personal data in it.
+_USER_AGENT = "MediLink/1.0 (emergency alert service; +https://medilink-backend-6a75.onrender.com)"
+_NOMINATIM_TIMEOUT = 4.0
+_OVERPASS_TIMEOUT = 5.0
 
 
 def _address_from_tags(tags: Dict[str, Any]) -> Optional[str]:
@@ -24,6 +29,16 @@ def _address_from_tags(tags: Dict[str, Any]) -> Optional[str]:
     ]
     parts = [p.strip() for p in parts if p and str(p).strip()]
     return ", ".join(parts) if parts else None
+
+
+def _short_address(address: Dict[str, Any]) -> Optional[str]:
+    """SMS-sized address from Nominatim `addressdetails`: street, area, city, postcode -- only the
+    parts OSM actually has. None (never a placeholder) when there is nothing usable."""
+    street = " ".join(p for p in [address.get("house_number"), address.get("road")] if p)
+    area = address.get("suburb") or address.get("neighbourhood") or address.get("quarter")
+    city = address.get("city") or address.get("town") or address.get("village") or address.get("county")
+    parts = [p.strip() for p in [street, area, city, address.get("postcode")] if p and str(p).strip()]
+    return ", ".join(dict.fromkeys(parts)) or None
 
 
 def _haversine_metres(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -42,7 +57,7 @@ class LocationService:
 
     async def reverse_geocode(self, latitude: float, longitude: float) -> Dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=4.0, headers={"User-Agent": "MEDILINK-demo/1.0"}) as client:
+            async with httpx.AsyncClient(timeout=4.0, headers={"User-Agent": _USER_AGENT}) as client:
                 response = await client.get(
                     f"{self.settings.nominatim_base_url}/reverse",
                     params={"format": "jsonv2", "lat": latitude, "lon": longitude},
@@ -53,11 +68,60 @@ class LocationService:
         except Exception as exc:
             return {"address": f"{latitude}, {longitude}", "provider": "FallbackCoordinates", "degraded": True, "errorMessage": str(exc)}
 
+    async def nearest_hospital(self, latitude: float, longitude: float, radius: int = 10000) -> Optional[Dict[str, Any]]:
+        """Nearest real OpenStreetMap hospital for escalation SMS: {name, address, latitude,
+        longitude, distanceMetres}. Nominatim first (answers in ~1 s), Overpass only if Nominatim
+        itself fails. Bounded (~9 s worst case) and best-effort: None on failure or no result, so
+        the SMS still goes out ("Nearest hospital: not available"). Never invents a hospital."""
+        # Nominatim returns at most 50 matches ranked by importance, not distance, so a wide box in a
+        # dense city can miss the closest hospital. Search a small box first; widen only if empty.
+        for box in (2000, 5000, radius):
+            found = await self._nearest_hospital_nominatim(latitude, longitude, min(box, radius))
+            if found is False:  # Nominatim errored (not "no hospitals") -- try the other OSM source.
+                return await self.nearest_hospital_overpass(latitude, longitude, radius)
+            if found:
+                return found
+            if box >= radius:
+                break
+        return None
+
+    async def _nearest_hospital_nominatim(self, latitude: float, longitude: float, radius: int) -> Optional[Dict[str, Any]] | bool:
+        """Returns the nearest hospital, None when there is none within `radius`, or False on error."""
+        dlat = radius / 111_320
+        dlon = radius / (111_320 * max(0.01, math.cos(math.radians(latitude))))
+        params = {
+            "amenity": "hospital", "format": "jsonv2", "limit": 50, "bounded": 1, "addressdetails": 1,
+            "viewbox": f"{longitude - dlon},{latitude + dlat},{longitude + dlon},{latitude - dlat}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_NOMINATIM_TIMEOUT, headers={"User-Agent": _USER_AGENT}) as client:
+                response = await client.get(f"{self.settings.nominatim_base_url}/search", params=params)
+                response.raise_for_status()
+                results = response.json()
+            if not isinstance(results, list):
+                return False
+        except Exception:
+            return False
+        best = None
+        for item in results:
+            try:
+                lat, lon = float(item["lat"]), float(item["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            distance = _haversine_metres(latitude, longitude, lat, lon)
+            if distance <= radius and (best is None or distance < best[0]):
+                best = (distance, item, lat, lon)
+        if best is None:
+            return None
+        distance, item, lat, lon = best
+        name = (item.get("name") or "").strip()
+        return {"name": name or "Unnamed hospital", "address": _short_address(item.get("address") or {}),
+                "latitude": lat, "longitude": lon, "distanceMetres": round(distance)}
+
     async def nearest_hospital_overpass(self, latitude: float, longitude: float, radius: int = 10000) -> Optional[Dict[str, Any]]:
-        """Nearest hospital name + address via the same free Overpass API the "Find My Hospital"
-        screen uses (frontend/lib/features/find_hospitals.dart), for use in escalation SMS.
-        Best-effort, single attempt: returns None on any failure or empty result so callers
-        (escalation_messages.py) can degrade gracefully rather than block/delay an emergency SMS."""
+        """Nearest hospital name + address via the free Overpass API -- the fallback source for
+        nearest_hospital(). Best-effort, single attempt: returns None on any failure or empty
+        result so callers (escalation_messages.py) degrade gracefully rather than block an SMS."""
         query = (
             f"[out:json][timeout:5];\n"
             f"(\n"
@@ -68,7 +132,7 @@ class LocationService:
             f"out center tags 20;\n"
         )
         try:
-            async with httpx.AsyncClient(timeout=6.0, headers={"User-Agent": "MEDILINK-demo/1.0"}) as client:
+            async with httpx.AsyncClient(timeout=_OVERPASS_TIMEOUT, headers={"User-Agent": _USER_AGENT}) as client:
                 response = await client.post(_OVERPASS_URL, data={"data": query})
                 response.raise_for_status()
                 elements = response.json().get("elements", [])
@@ -88,7 +152,10 @@ class LocationService:
         if nearest is None:
             return None
         tags = nearest.get("tags", {})
-        return {"name": tags.get("name") or "Unnamed hospital", "address": _address_from_tags(tags)}
+        centre = nearest.get("center") or {}
+        return {"name": tags.get("name") or "Unnamed hospital", "address": _address_from_tags(tags),
+                "latitude": nearest.get("lat", centre.get("lat")), "longitude": nearest.get("lon", centre.get("lon")),
+                "distanceMetres": round(nearest_distance)}
 
     async def nearby_hospitals(self, latitude: float, longitude: float, radius: int = 10000, limit: int = 10) -> list[Dict[str, Any]]:
         pipeline = [

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
@@ -61,6 +62,18 @@ const _overpassTimeout = Duration(seconds: 6);
 /// the server gives up first and returns a real error, rather than the client walking away from a
 /// query the server is still running.
 const _overpassServerBudgetSeconds = 5;
+
+/// OSM services reject generic client User-Agents -- overpass-api.de answers Dart's default
+/// `Dart/x (dart:io)` with an instant 406 -- and their usage policies require an identifying one.
+const _userAgent = 'MediLink/1.0 (Android; +https://medilink-backend-6a75.onrender.com)';
+
+/// Nominatim answers hospital searches in ~0.3-2 s, where public Overpass instances were measured
+/// at 20-50 s under load, so it is tried first; Overpass is the fallback when Nominatim fails.
+const _nominatimTimeout = Duration(seconds: 8);
+
+/// Nominatim's per-request maximum. Results are ranked by importance, not distance, so a capped
+/// result set may have skipped a closer, smaller hospital -- see searchNominatimHospitals().
+const _nominatimCap = 50;
 
 /// Search radii, in metres. The empty state walks the user up this ladder one step at a time.
 const _radiusLadder = [5000, 10000, 25000, 50000];
@@ -138,14 +151,123 @@ Future<LocationFix> resolveLocationFix() async {
   if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
     throw const HospitalSearchException(HospitalSearchFailure.locationPermissionDenied);
   }
+  // Without a time limit, a high-accuracy request indoors (no sky view) can wait forever, which
+  // is what left the screen stuck on "Getting your location...".
   try {
     final position = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, timeLimit: Duration(seconds: 15)),
     );
     return LocationFix(LatLng(position.latitude, position.longitude), position.accuracy);
   } catch (_) {
-    throw const HospitalSearchException(HospitalSearchFailure.locationUnavailable);
+    // No GPS fix in time: use a recent fix the phone already has, then a network-based one. The
+    // coarse-accuracy banner tells the user when either is imprecise.
+    try {
+      final last = await Geolocator.getLastKnownPosition();
+      if (last != null && DateTime.now().difference(last.timestamp) < const Duration(minutes: 10)) {
+        return LocationFix(LatLng(last.latitude, last.longitude), last.accuracy);
+      }
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.medium, timeLimit: Duration(seconds: 10)),
+      );
+      return LocationFix(LatLng(position.latitude, position.longitude), position.accuracy);
+    } catch (_) {
+      throw const HospitalSearchException(HospitalSearchFailure.locationUnavailable);
+    }
   }
+}
+
+/// Nominatim search for hospitals inside the square that encloses a `radiusMetres` circle.
+Uri nominatimSearchUri(LatLng centre, int radiusMetres) {
+  final dLat = radiusMetres / 111320;
+  final dLon = radiusMetres / (111320 * math.max(0.01, math.cos(centre.latitude * math.pi / 180)));
+  return Uri.https('nominatim.openstreetmap.org', '/search', {
+    'amenity': 'hospital',
+    'format': 'jsonv2',
+    'limit': '$_nominatimCap',
+    'bounded': '1',
+    'addressdetails': '1',
+    'extratags': '1',
+    'viewbox': '${centre.longitude - dLon},${centre.latitude + dLat},${centre.longitude + dLon},${centre.latitude - dLat}',
+  });
+}
+
+/// One-line address from Nominatim `addressdetails`; null (never a placeholder) when empty.
+String? addressFromNominatim(Map<String, dynamic> address) {
+  final street = [address['house_number'], address['road']]
+      .where((p) => p != null && p.toString().trim().isNotEmpty)
+      .join(' ');
+  final parts = <String>{
+    for (final p in [
+      street,
+      address['suburb'] ?? address['neighbourhood'] ?? address['quarter'],
+      address['city'] ?? address['town'] ?? address['village'] ?? address['county'],
+      address['postcode'],
+    ])
+      if (p != null && p.toString().trim().isNotEmpty) p.toString().trim(),
+  };
+  return parts.isEmpty ? null : parts.join(', ');
+}
+
+/// Parses a Nominatim result list into hospitals within `radiusMetres`. Returns null when the
+/// body is not a Nominatim result list at all (an error page, a rate-limit notice).
+({List<Hospital> hospitals, bool capped})? parseNominatim(String body, LatLng centre, int radiusMetres) {
+  final Object? decoded;
+  try {
+    decoded = jsonDecode(body);
+  } catch (_) {
+    return null;
+  }
+  if (decoded is! List) return null;
+  final results = <Hospital>[];
+  for (final raw in decoded) {
+    if (raw is! Map) continue;
+    final lat = double.tryParse('${raw['lat']}');
+    final lng = double.tryParse('${raw['lon']}');
+    if (lat == null || lng == null) continue;
+    final distance = Geolocator.distanceBetween(centre.latitude, centre.longitude, lat, lng);
+    if (distance > radiusMetres) continue; // The box's corners lie outside the circle.
+    final extra = raw['extratags'] is Map ? Map<String, dynamic>.from(raw['extratags'] as Map) : <String, dynamic>{};
+    final name = raw['name']?.toString().trim();
+    final phone = (extra['phone'] ?? extra['contact:phone'])?.toString().trim();
+    results.add(Hospital(
+      id: '${raw['osm_type'] ?? 'node'}/${raw['osm_id'] ?? results.length}',
+      name: (name == null || name.isEmpty) ? 'Hospital' : name,
+      point: LatLng(lat, lng),
+      distanceMetres: distance,
+      address: raw['address'] is Map ? addressFromNominatim(Map<String, dynamic>.from(raw['address'] as Map)) : null,
+      phone: (phone == null || phone.isEmpty) ? null : phone,
+      emergency: extra['emergency']?.toString() == 'yes',
+    ));
+  }
+  return (hospitals: results, capped: decoded.length >= _nominatimCap);
+}
+
+/// Hospitals within `radiusMetres` from Nominatim, nearest first, or null when Nominatim fails
+/// (caller falls back to Overpass). When the wide search hits Nominatim's 50-result cap, a 2 km
+/// search is merged in too, so a close hospital outranked by bigger far-away ones isn't lost.
+Future<List<Hospital>?> searchNominatimHospitals(LatLng centre, int radiusMetres, http.Client client) async {
+  Future<({List<Hospital> hospitals, bool capped})?> search(int radius) async {
+    try {
+      final response = await client
+          .get(nominatimSearchUri(centre, radius), headers: {'User-Agent': _userAgent})
+          .timeout(_nominatimTimeout);
+      return response.statusCode == 200 ? parseNominatim(response.body, centre, radius) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  final wide = await search(radiusMetres);
+  if (wide == null) return null;
+  final merged = {for (final h in wide.hospitals) h.id: h};
+  if (wide.capped && radiusMetres > 2000) {
+    final near = await search(2000);
+    for (final h in near?.hospitals ?? const <Hospital>[]) {
+      merged[h.id] = h;
+    }
+  }
+  final sorted = merged.values.toList()..sort((a, b) => a.distanceMetres.compareTo(b.distanceMetres));
+  return dedupeHospitals(sorted);
 }
 
 String buildOverpassQuery(LatLng centre, int radiusMetres) {
@@ -277,13 +399,30 @@ List<Hospital> dedupeHospitals(List<Hospital> sorted) {
   return kept;
 }
 
+/// Nearby hospitals for the screen: Nominatim first (fast), the Overpass mirror chain only if
+/// Nominatim itself fails. Throws HospitalSearchException with a classified failure.
+Future<List<Hospital>> fetchNearbyHospitals(
+  LatLng centre,
+  int radiusMetres, {
+  http.Client? client,
+}) async {
+  final httpClient = client ?? http.Client();
+  try {
+    final found = await searchNominatimHospitals(centre, radiusMetres, httpClient);
+    if (found != null) return found;
+    return await fetchOverpassHospitals(centre, radiusMetres, client: httpClient);
+  } finally {
+    if (client == null) httpClient.close();
+  }
+}
+
 /// Fetches hospitals from Overpass, falling through `_overpassEndpoints` in sequence -- primary,
 /// then every fallback mirror in order -- until one answers or all of them have failed. Each
 /// attempt gets its own short `_overpassTimeout` rather than one attempt getting the whole
 /// budget, so a single hanging mirror can't consume the entire search. Failures are classified
 /// before they leave this function so the UI never has to parse an exception string to decide
 /// what to tell the user.
-Future<List<Hospital>> fetchNearbyHospitals(
+Future<List<Hospital>> fetchOverpassHospitals(
   LatLng centre,
   int radiusMetres, {
   http.Client? client,
@@ -295,7 +434,7 @@ Future<List<Hospital>> fetchNearbyHospitals(
     for (final endpoint in _overpassEndpoints) {
       try {
         final response = await httpClient
-            .post(Uri.parse(endpoint), body: {'data': query})
+            .post(Uri.parse(endpoint), headers: {'User-Agent': _userAgent}, body: {'data': query})
             .timeout(_overpassTimeout);
         if (response.statusCode == 200) {
           // Overpass reports its *own* failures (rate limit, server-side timeout, out of memory)

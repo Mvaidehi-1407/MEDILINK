@@ -1,9 +1,12 @@
 import html
+import ipaddress
 import secrets
 from datetime import timedelta, timezone
+from urllib.parse import quote, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import HTMLResponse
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.auth.security import create_token, decode_token
@@ -11,7 +14,8 @@ from app.config import get_settings
 from app.dependencies import db, get_current_user
 from app.repositories.base import MongoRepository
 from app.schemas.qr import QRCreateRequest
-from app.services.document_summary import DISCLAIMER
+from app.services.consent_service import ConsentService
+from app.services.document_summary import DISCLAIMER, MISSING_FILE_ERRORS, read_bytes
 from app.utils.time import utcnow
 
 
@@ -24,17 +28,41 @@ def _aware(dt):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
-def _share_out(share: dict, token: str | None = None) -> dict:
+def _is_local_host(host: str) -> bool:
+    """Addresses another phone on another network can't open: loopback, emulator, LAN, link-local."""
+    host = host.strip("[]").lower()
+    if host in ("localhost", "") or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified
+
+
+def _share_base(request: Request) -> str:
+    """Base URL encoded in share QR codes. PUBLIC_BASE_URL when it is a real public address;
+    otherwise (unset -> the localhost default, or a LAN IP) the public address this request
+    actually reached the server on -- behind Render, its https host -- so a QR never encodes an
+    address only this machine or network can open."""
+    configured = get_settings().public_base_url.rstrip("/")
+    if not _is_local_host(urlparse(configured).hostname or ""):
+        return configured
+    return str(request.base_url).rstrip("/")
+
+
+def _share_out(share: dict, token: str | None = None, request: Request | None = None) -> dict:
     out = {"id": share["jti"], "expiresAt": share["expiresAt"], "createdAt": share["createdAt"]}
     if token:
         out["token"] = token
-        out["url"] = f"{get_settings().public_base_url.rstrip('/')}/share/{token}"
+        base = _share_base(request) if request is not None else get_settings().public_base_url.rstrip("/")
+        out["url"] = f"{base}/share/{token}"
     return out
 
 
 # ---- Signed, expiring, revocable share QR ------------------------------------------------
 @router.post("/share")
-async def create_share(user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
+async def create_share(request: Request, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     """New share link for the signed-in patient. Any earlier link is revoked (one active at a time)."""
     shares = database["qr_shares"]
     await shares.update_many({"patientId": user["id"], "revoked": False}, {"$set": {"revoked": True, "revokedAt": utcnow()}})
@@ -44,15 +72,15 @@ async def create_share(user: dict = Depends(get_current_user), database: AsyncIO
     share = {"jti": jti, "patientId": user["id"], "token": token, "expiresAt": expires_at,
              "createdAt": utcnow(), "revoked": False}
     await shares.insert_one(dict(share))
-    return _share_out(share, token)
+    return _share_out(share, token, request)
 
 
 @router.get("/share/current")
-async def current_share(user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
+async def current_share(request: Request, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     share = await database["qr_shares"].find_one({"patientId": user["id"], "revoked": False}, sort=[("createdAt", -1)])
     if not share or _aware(share["expiresAt"]) <= utcnow():
         return {"active": False}
-    return {"active": True, **_share_out(share, share["token"])}
+    return {"active": True, **_share_out(share, share["token"], request)}
 
 
 @router.post("/share/{share_id}/revoke")
@@ -108,15 +136,18 @@ def _sections(s: dict) -> str:
             + _list("Follow-ups", s.get("followUps")))
 
 
-def _doc_card(record: dict) -> str:
+def _doc_card(record: dict, token: str | None = None) -> str:
     state = record.get("aiSummary") or {}
     s = state.get("summary") if state.get("status") == "READY" else None
     title = f"<h2>{_e(record.get('filename'))}</h2>"
+    # Relative link: the file route re-checks the same signed, expiring, revocable token.
+    link = (f"<p><a href='{_e(quote(token, safe=''))}/reports/{_e(record['id'])}' target='_blank' rel='noopener noreferrer'>"
+            f"Open report</a></p>") if token and record.get("id") else ""
     if not s:
-        return f"<div class='card'>{title}<p class='muted'>Summary not generated yet.</p></div>"
+        return f"<div class='card'>{title}<p class='muted'>Summary not generated yet.</p>{link}</div>"
     meta = " &middot; ".join(x for x in (_e(s.get("documentType")), _e(s.get("date"))) if x)
     body = "<p class='muted'>This document could not be read.</p>" if s.get("unreadable") else _sections(s)
-    return f"<div class='card'>{title}<p class='muted'>{meta}</p>{body}</div>"
+    return f"<div class='card'>{title}<p class='muted'>{meta}</p>{body}{link}</div>"
 
 
 def _page(title: str, body: str, code: int = 200) -> HTMLResponse:
@@ -129,18 +160,26 @@ def _closed(message: str, code: int) -> HTMLResponse:
     return _page("MediLink", f"<div class='card'><h1>This link isn't available</h1><p class='muted'>{_e(message)}</p></div>", code)
 
 
-@public_router.get("/share/{token}", response_class=HTMLResponse)
-async def share_page(token: str, database: AsyncIOMotorDatabase = Depends(db)):
-    """Read-only page for whoever scans the QR. Shows cached summaries only; never calls Gemini."""
+async def _valid_share(token: str, database: AsyncIOMotorDatabase) -> tuple[dict | None, HTMLResponse | None]:
+    """(share, None) for a genuine, unexpired, unrevoked share token; otherwise (None, page)."""
     try:
         claims = decode_token(token)  # Verifies signature and expiry.
     except ValueError:
-        return _closed("This QR code has expired or isn't valid. Ask the patient to show a new one.", 410)
+        return None, _closed("This QR code has expired or isn't valid. Ask the patient to show a new one.", 410)
     if claims.get("type") != "qr_share":
-        return _closed("This QR code isn't valid.", 404)
+        return None, _closed("This QR code isn't valid.", 404)
     share = await database["qr_shares"].find_one({"jti": claims.get("jti")})
     if not share or share.get("revoked"):
-        return _closed("The patient turned off this QR code. Ask them to show a new one.", 410)
+        return None, _closed("The patient turned off this QR code. Ask them to show a new one.", 410)
+    return share, None
+
+
+@public_router.get("/share/{token}", response_class=HTMLResponse)
+async def share_page(token: str, database: AsyncIOMotorDatabase = Depends(db)):
+    """Read-only page for whoever scans the QR. Shows cached summaries only; never calls Gemini."""
+    share, closed = await _valid_share(token, database)
+    if closed:
+        return closed
 
     patient_id = share["patientId"]
     user = await MongoRepository(database, "users").get(patient_id) or {}
@@ -167,14 +206,41 @@ async def share_page(token: str, database: AsyncIOMotorDatabase = Depends(db)):
         parts.append("<div class='card'><span class='pill'>Combined overview</span>"
                      + (_sections(overview) if isinstance(overview, dict) else "<p class='muted'>Combined summary not generated yet.</p>")
                      + "</div>")
-    parts.extend(_doc_card(r) for r in records)
+    parts.extend(_doc_card(r, token) for r in records)
     parts.append(f"<p class='note'><b>{DISCLAIMER}</b> Summaries are generated by AI from the patient's uploaded files and may contain mistakes.</p>")
     return _page(f"{name} | MediLink", "".join(parts))
+
+
+@public_router.get("/share/{token}/reports/{record_id}")
+async def share_report_file(token: str, record_id: str, database: AsyncIOMotorDatabase = Depends(db)):
+    """One of the sharing patient's own reports, opened from the share page. Same checks as the
+    page (signature, expiry, revocation) on every request, and the record must belong to the
+    patient who issued this token -- a valid token never opens anyone else's report."""
+    share, closed = await _valid_share(token, database)
+    if closed:
+        return closed
+    record = await database["medical_records"].find_one({"_id": ObjectId(record_id)}) if ObjectId.is_valid(record_id) else None
+    if not record or record.get("patientId") != share["patientId"]:
+        return _closed("This report isn't part of this share.", 404)
+    try:
+        data = await read_bytes(database, record)
+    except MISSING_FILE_ERRORS:
+        return _closed("This report's file is no longer available. Ask the patient to upload it again.", 404)
+    filename = str(record.get("filename") or "report").replace('"', "").replace("\\", "")
+    return Response(data, media_type=record.get("contentType") or "application/octet-stream", headers={
+        "Content-Disposition": f"inline; filename=\"{filename}\"",
+        "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex",
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 # ---- Legacy in-app QR (raw token scanned inside the app) ---------------------------------
 @router.post("")
 async def create_qr(payload: QRCreateRequest, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
+    # A QR for someone else exposes their contacts and report summaries, so it needs that
+    # patient's consent -- previously any signed-in user could mint one for any patientId.
+    if payload.patientId and payload.patientId != user["id"] and not await ConsentService(database).has_access(payload.patientId, user["id"], "medical_records"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only create a QR code for your own records.")
     token = secrets.token_urlsafe(32)
     now = utcnow()
     return await MongoRepository(database, "qr_identities").insert({

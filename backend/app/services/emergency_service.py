@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any, Dict
@@ -340,10 +341,18 @@ class EmergencyService:
             "patientResponse": PatientResponse.NEED_HELP.value if payload.patientResponse != "NO_RESPONSE" else PatientResponse.NO_RESPONSE.value,
         }
         if payload.location:
-            geo = {"type": "Point", "coordinates": [payload.location.longitude, payload.location.latitude]}
-            address = await self.location.reverse_geocode(payload.location.latitude, payload.location.longitude)
-            hospitals = await self.location.nearby_hospitals(payload.location.latitude, payload.location.longitude)
+            lat, lng = payload.location.latitude, payload.location.longitude
+            geo = {"type": "Point", "coordinates": [lng, lat]}
+            # All three lookups are independent and individually bounded/best-effort; run them
+            # together so the Stage-1 SMS isn't held up by their sum.
+            address, hospitals, nearest = await asyncio.gather(
+                self.location.reverse_geocode(lat, lng),
+                self.location.nearby_hospitals(lat, lng),
+                self.location.nearest_hospital(lat, lng),
+            )
             update_fields.update({"location": geo, "address": address["address"], "nearbyHospitals": hospitals})
+            if nearest:
+                update_fields["nearestHospital"] = nearest  # Reused by every later SMS for this emergency.
             details.update({"location": geo, "address": address})
 
         notification_status = await self._notify_emergency_roles(emergency_id, emergency["patientId"])
@@ -356,8 +365,11 @@ class EmergencyService:
         return updated
 
     async def _nearest_hospital(self, emergency: dict) -> dict | None:
-        """Best-effort nearest-hospital lookup for escalation SMS -- returns None (never blocks or
-        delays the alert) when the emergency has no location yet or Overpass doesn't answer."""
+        """Best-effort nearest-hospital lookup for escalation SMS -- returns None (never blocks the
+        alert) when the emergency has no location yet or no OSM source answers. Uses the result
+        stored at confirm time when there is one."""
+        if emergency.get("nearestHospital"):
+            return emergency["nearestHospital"]
         location = emergency.get("location")
         if not location:
             return None
@@ -365,7 +377,7 @@ class EmergencyService:
         longitude, latitude = coords[0], coords[1]
         if latitude is None or longitude is None:
             return None
-        return await self.location.nearest_hospital_overpass(latitude, longitude)
+        return await self.location.nearest_hospital(latitude, longitude)
 
     def _next_attempt_delay(self, attempt_status: str) -> timedelta:
         if attempt_status == "NO_DEVICE_CONNECTED":
