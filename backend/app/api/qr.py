@@ -1,5 +1,6 @@
 import html
 import ipaddress
+import os
 import secrets
 from datetime import timedelta, timezone
 from urllib.parse import quote, urlparse
@@ -48,6 +49,12 @@ def _share_base(request: Request) -> str:
     configured = get_settings().public_base_url.rstrip("/")
     if not _is_local_host(urlparse(configured).hostname or ""):
         return configured
+    # Render sets this to the service's public https URL; it wins over a LAN/localhost
+    # PUBLIC_BASE_URL copied from a developer's .env.
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if render_url and not _is_local_host(urlparse(render_url).hostname or ""):
+        return render_url
+    # Local development: the address the phone actually reached this machine on.
     return str(request.base_url).rstrip("/")
 
 

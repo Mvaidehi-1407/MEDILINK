@@ -113,6 +113,39 @@ def test_share_url_never_encodes_a_local_address(qr_env, monkeypatch, configured
     assert client.get("/api/qr/share/current").json()["url"] == share["url"]
 
 
+def test_render_public_url_beats_a_lan_public_base_url(monkeypatch, memory_gridfs):
+    """The real bug: PUBLIC_BASE_URL=http://10.170.202.191:8000 (a LAN IP from a dev .env)."""
+    monkeypatch.setattr(get_settings(), "public_base_url", "http://10.170.202.191:8000")
+    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://medilink-backend-6a75.onrender.com")
+    database = AsyncMongoMockClient()["qr_render"]
+
+    async def _user():
+        return PATIENT
+
+    async def _db():
+        return database
+
+    app.dependency_overrides[get_current_user] = _user
+    app.dependency_overrides[db] = _db
+    try:
+        # Even when the request itself arrives on a LAN address.
+        client = TestClient(app, base_url="http://10.170.202.191:8000")
+        share = client.post("/api/qr/share").json()
+    finally:
+        app.dependency_overrides.clear()
+    from urllib.parse import urlparse
+    url = urlparse(share["url"])
+    assert url.scheme == "https" and url.hostname == "medilink-backend-6a75.onrender.com"
+    assert url.path == f"/share/{share['token']}"
+
+
+def test_local_development_keeps_lan_links(qr_env, monkeypatch):
+    monkeypatch.setattr(get_settings(), "public_base_url", "http://10.170.202.191:8000")
+    monkeypatch.delenv("RENDER_EXTERNAL_URL", raising=False)
+    client = TestClient(app, base_url="http://10.170.202.191:8000")
+    assert client.post("/api/qr/share").json()["url"].startswith("http://10.170.202.191:8000/share/")
+
+
 def test_share_url_keeps_a_configured_public_address(qr_env, monkeypatch):
     monkeypatch.setattr(get_settings(), "public_base_url", "https://medilink-backend-6a75.onrender.com")
     share = qr_env[0].post("/api/qr/share").json()
