@@ -707,6 +707,8 @@ class AiSummaryView extends StatelessWidget {
   Widget build(BuildContext context) {
     final docs = (summary['documents'] as List?)?.whereType<Map>().toList();
     final overview = summary['overview'];
+    // Reports the combined summary had to leave out (e.g. file missing on the server).
+    final skipped = (summary['skippedDocuments'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -725,6 +727,12 @@ class AiSummaryView extends StatelessWidget {
             ..._sections(Map<String, dynamic>.from(d)),
             const SizedBox(height: AppSpacing.lg),
           ],
+        if (skipped.isNotEmpty) ...[
+          Text('Not included', style: AppText.titleSm),
+          for (final s in skipped)
+            Text('• ${s['filename'] ?? 'Report'}: ${s['reason'] ?? "This file couldn't be read."}', style: AppText.bodySm),
+          const SizedBox(height: AppSpacing.md),
+        ],
         const SizedBox(height: AppSpacing.sm),
         Container(
           width: double.infinity,

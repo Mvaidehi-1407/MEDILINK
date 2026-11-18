@@ -635,8 +635,7 @@ class AppSettingsPage extends ConsumerWidget {
   }
 }
 
-/// Same compile-time default the ApiClient uses (`--dart-define=MEDILINK_API_URL=...`).
-const defaultApiBaseUrl = String.fromEnvironment('MEDILINK_API_URL', defaultValue: 'http://10.0.2.2:8000/api');
+// defaultApiBaseUrl / normalizeApiBaseUrl live in core/session.dart (shared with ApiClient + WS).
 const _apiUrlPref = 'medilink_api_url';
 
 /// Lets a physical phone point at the backend. The emulator default (10.0.2.2) is the reason a
@@ -661,15 +660,7 @@ class _ServerSettingsPageState extends ConsumerState<ServerSettingsPage> {
     super.dispose();
   }
 
-  String _normalise(String raw) {
-    var u = raw.trim();
-    while (u.endsWith('/')) {
-      u = u.substring(0, u.length - 1);
-    }
-    if (u.isNotEmpty && !u.startsWith('http://') && !u.startsWith('https://')) u = 'http://$u';
-    if (u.isNotEmpty && !u.endsWith('/api')) u = '$u/api';
-    return u;
-  }
+  String _normalise(String raw) => normalizeApiBaseUrl(raw);
 
   Future<void> _test() async {
     final url = _normalise(_url.text);
@@ -701,7 +692,8 @@ class _ServerSettingsPageState extends ConsumerState<ServerSettingsPage> {
   Future<void> _save({bool reset = false}) async {
     final prefs = await SharedPreferences.getInstance();
     final session = ref.read(sessionProvider.notifier);
-    if (reset) {
+    // Saving the build default stores nothing, so a future default change still applies.
+    if (reset || _normalise(_url.text) == defaultApiBaseUrl) {
       await prefs.remove(_apiUrlPref);
       session.apiBaseUrl = null;
       _url.text = defaultApiBaseUrl;

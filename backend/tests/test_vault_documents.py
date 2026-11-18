@@ -5,6 +5,7 @@ import io
 import zipfile
 
 import pytest
+from bson import ObjectId
 from fastapi.testclient import TestClient
 from mongomock_motor import AsyncMongoMockClient
 
@@ -27,7 +28,7 @@ def _docx(text: str) -> bytes:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, memory_gridfs):
     database = AsyncMongoMockClient()["vault_test"]
     monkeypatch.setattr(get_settings(), "storage_dir", str(tmp_path))
     monkeypatch.setattr(get_settings(), "llm_api_key", "test-key")
@@ -52,18 +53,54 @@ def _upload(client, name, data, category="Lab"):
                        files={"file": (name, data, "application/octet-stream")})
 
 
-def test_upload_rename_text_delete_on_disk(env):
+def test_upload_rename_text_delete_in_gridfs(env, memory_gridfs):
     client, _, _, root = env
-    r = _upload(client, "report.docx", _docx("Haemoglobin 10.2 g/dL"))
+    data = _docx("Haemoglobin 10.2 g/dL")
+    r = _upload(client, "report.docx", data)
     assert r.status_code == 200, r.text
     rec = r.json()
-    assert rec["contentType"] == ds.DOCX and (root / rec["storagePath"]).exists() and rec["fileHash"]
+    stored = memory_gridfs[ObjectId(rec["gridfsId"])]
+    assert rec["contentType"] == ds.DOCX and stored["data"] == data and rec["fileHash"]
+    assert stored["metadata"]["patientId"] == USER["id"] and stored["metadata"]["sha256"] == rec["fileHash"]
+    assert "storagePath" not in rec and not any(root.iterdir())  # Nothing written to the server disk.
     assert client.get(f"/api/medical-records/{rec['id']}/text").json()["text"] == "Haemoglobin 10.2 g/dL"
     renamed = client.patch(f"/api/medical-records/{rec['id']}", json={"filename": "CBC March"}).json()
     assert renamed["filename"] == "CBC March.docx"
     assert client.get(f"/api/medical-records/{rec['id']}").content.startswith(b"PK")
     assert client.delete(f"/api/medical-records/{rec['id']}").json() == {"deleted": True}
-    assert not (root / rec["storagePath"]).exists()
+    assert ObjectId(rec["gridfsId"]) not in memory_gridfs
+
+
+def test_legacy_storage_path_record_still_works(env):
+    """Records uploaded before GridFS keep `storagePath` on disk and stay readable/deletable."""
+    client, database, _, root = env
+    (root / "old.txt").write_bytes(b"Old report: glucose 180 mg/dL")
+    rec = asyncio.run(ds.MongoRepository(database, "medical_records").insert({
+        "patientId": USER["id"], "ownerId": USER["id"], "filename": "old.txt", "contentType": "text/plain",
+        "category": "Lab", "size": 29, "storagePath": "old.txt", "fileHash": "x"}))
+    assert client.get(f"/api/medical-records/{rec['id']}").content == b"Old report: glucose 180 mg/dL"
+    assert client.get(f"/api/medical-records/{rec['id']}/text").json()["text"].startswith("Old report")
+    assert client.delete(f"/api/medical-records/{rec['id']}").json() == {"deleted": True}
+    assert not (root / "old.txt").exists()
+
+
+def test_missing_file_is_404_not_500(env, memory_gridfs):
+    client, *_ = env
+    rec = _upload(client, "r.docx", _docx("x")).json()
+    memory_gridfs.clear()  # File gone from GridFS, record still there.
+    assert client.get(f"/api/medical-records/{rec['id']}").status_code == 404
+    assert client.get(f"/api/medical-records/{rec['id']}/text").status_code == 404
+
+
+def test_failed_record_insert_removes_the_gridfs_file(env, memory_gridfs, monkeypatch):
+    client, database, *_ = env
+
+    async def broken_insert(self, doc):
+        raise RuntimeError("database write failed")
+
+    monkeypatch.setattr(ds.MongoRepository, "insert", broken_insert)
+    r = _upload(client, "r.docx", _docx("x"))
+    assert r.status_code == 503 and memory_gridfs == {}  # No orphaned file left behind.
 
 
 def test_rejects_doc_unknown_and_oversize(env):
@@ -73,7 +110,7 @@ def test_rejects_doc_unknown_and_oversize(env):
     assert _upload(client, "big.pdf", b"0" * (get_settings().max_upload_bytes + 1)).status_code == 413
 
 
-def test_heic_converted_to_jpeg(env):
+def test_heic_converted_to_jpeg(env, memory_gridfs):
     from PIL import Image
     from pillow_heif import register_heif_opener
 
@@ -82,7 +119,7 @@ def test_heic_converted_to_jpeg(env):
     Image.new("RGB", (40, 30), "white").save(buf, "HEIF")
     rec = _upload(env[0], "scan.heic", buf.getvalue(), "Scan").json()
     assert rec["contentType"] == "image/jpeg" and rec["filename"] == "scan.jpg"
-    assert (env[3] / rec["storagePath"]).read_bytes()[:2] == b"\xff\xd8"
+    assert memory_gridfs[ObjectId(rec["gridfsId"])]["data"][:2] == b"\xff\xd8"
 
 
 def test_pdf_page_render(env):
@@ -152,7 +189,7 @@ def test_share_qr_create_view_revoke_expiry(env, monkeypatch):
     client, database, current, _ = env
     rec = _upload(client, "r.docx", _docx("x")).json()
     asyncio.run(database["medical_records"].update_one(
-        {"storagePath": rec["storagePath"]},
+        {"gridfsId": rec["gridfsId"]},
         {"$set": {"aiSummary": {"status": "READY", "summary": {"documentType": "Lab report", "keyFindings": ["<b>Low iron</b>"]}}}}))
     share = client.post("/api/qr/share").json()
     assert share["url"].endswith(f"/share/{share['token']}")

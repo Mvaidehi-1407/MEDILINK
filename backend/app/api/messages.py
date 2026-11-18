@@ -1,9 +1,10 @@
-import uuid
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import PyMongoError
 
 from app.config import get_settings
 from app.dependencies import db, get_current_user
@@ -12,11 +13,12 @@ from app.rate_limit import limiter
 from app.repositories.base import MongoRepository
 from app.schemas.message import MessageCreate
 from app.services.doctor_access import is_linked, notify
-from app.services.document_summary import EXTENSIONS, storage_root
+from app.services.document_summary import EXTENSIONS, MISSING_FILE_ERRORS, delete_file, read_bytes, save_file
 from app.utils.time import utcnow
 from app.websocket.manager import manager
 
 
+logger = logging.getLogger("medilink.messages")
 router = APIRouter(prefix="/messages", tags=["messages"])
 CHAT_TYPES = {"pdf", "png", "jpg", "jpeg"}  # Vault types a chat can carry (no conversion needed).
 
@@ -101,12 +103,22 @@ async def send_attachment(request: Request, conversationId: str = Form(...), cli
     magic = {"pdf": b"%PDF", "png": b"\x89PNG", "jpg": b"\xff\xd8", "jpeg": b"\xff\xd8"}[ext]
     if not data.startswith(magic):
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="This file doesn't match its type. Send a real PDF or photo.")
-    stored = f"chat_{uuid.uuid4().hex}.{ext}"
-    (storage_root() / stored).write_bytes(data)
-    attachment = await MongoRepository(database, "message_attachments").insert({
-        "conversationId": conversationId, "uploaderId": user["id"], "filename": filename, "contentType": EXTENSIONS[ext],
-        "size": len(data), "storagePath": stored, "createdAt": utcnow(),
-    })
+    # Stored in GridFS (not the server disk); the record only exists once its file does.
+    try:
+        gridfs_id = await save_file(database, data, filename, EXTENSIONS[ext],
+                                    {"kind": "chat_attachment", "conversationId": conversationId, "uploaderId": user["id"]})
+    except PyMongoError:
+        logger.exception("GridFS upload failed for chat attachment")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We couldn't send this file. Please try again.")
+    try:
+        attachment = await MongoRepository(database, "message_attachments").insert({
+            "conversationId": conversationId, "uploaderId": user["id"], "filename": filename, "contentType": EXTENSIONS[ext],
+            "size": len(data), "gridfsId": gridfs_id, "createdAt": utcnow(),
+        })
+    except Exception:
+        logger.exception("Chat attachment insert failed; removing its GridFS file")
+        await delete_file(database, {"gridfsId": gridfs_id})
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We couldn't send this file. Please try again.")
     meta = {k: attachment[k] for k in ("id", "filename", "contentType", "size")}
     await _notify_new(database, user, other_id, conversationId, "ReportShared", "New document shared")
     return await _insert_and_broadcast(database, {
@@ -121,10 +133,14 @@ async def get_attachment(attachment_id: str, user: dict = Depends(get_current_us
     if not attachment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found")
     await assert_participant(attachment["conversationId"], user, database, read=True)
-    path = storage_root() / attachment["storagePath"]
-    if not path.exists():
+    try:
+        data = await read_bytes(database, attachment)  # GridFS, or disk for older attachments.
+    except MISSING_FILE_ERRORS:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This file is missing from the server.")
-    return Response(path.read_bytes(), media_type=attachment["contentType"], headers={"Content-Disposition": f"inline; filename=\"{attachment['filename']}\""})
+    except PyMongoError:
+        logger.exception("GridFS read failed for attachment %s", attachment_id)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We couldn't load this file. Please try again.")
+    return Response(data, media_type=attachment["contentType"], headers={"Content-Disposition": f"inline; filename=\"{attachment['filename']}\""})
 
 
 @router.post("/{conversation_id}/read")

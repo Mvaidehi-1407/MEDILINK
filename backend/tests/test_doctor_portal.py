@@ -154,8 +154,7 @@ def test_ended_connection_blocks_chat_and_data(env):
     assert run(database.conversations.count_documents({})) == 1
 
 
-def test_stranger_cannot_post_and_attachment_validated(env, tmp_path, monkeypatch):
-    monkeypatch.setattr("app.api.messages.storage_root", lambda: tmp_path)  # keep test files out of real storage
+def test_stranger_cannot_post_and_attachment_validated(env, memory_gridfs):
     as_, people, _ = env
     req = _request(as_, people).json()
     cid = as_("doc").post(f"/api/doctor/requests/{req['id']}/accept").json()["conversationId"]
@@ -165,7 +164,9 @@ def test_stranger_cannot_post_and_attachment_validated(env, tmp_path, monkeypatc
     ok = as_("pat").post("/api/messages/attachments", data={"conversationId": cid}, files={"file": ("lab.pdf", b"%PDF-1.4 test", "application/pdf")})
     assert ok.status_code == 200
     att = ok.json()["attachment"]["id"]
-    assert as_("doc").get(f"/api/messages/attachments/{att}").status_code == 200
+    got = as_("doc").get(f"/api/messages/attachments/{att}")
+    assert got.status_code == 200 and got.content == b"%PDF-1.4 test"
+    assert [f["metadata"]["kind"] for f in memory_gridfs.values()] == ["chat_attachment"]  # Stored in GridFS.
     assert as_("other").get(f"/api/messages/attachments/{att}").status_code == 403
 
 

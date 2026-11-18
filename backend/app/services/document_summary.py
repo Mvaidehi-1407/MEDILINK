@@ -1,6 +1,7 @@
 """Vault document storage helpers + Gemini summaries (single + combined).
 
-Files live on disk under STORAGE_DIR; metadata (incl. cached summaries) lives in Mongo.
+New files live in MongoDB GridFS; records from before that keep a `storagePath` on disk under
+STORAGE_DIR and stay readable. Metadata (incl. cached summaries) lives in Mongo.
 Gemini runs in a background task so the app can poll without hitting its 20 s HTTP timeout.
 """
 import asyncio
@@ -12,11 +13,12 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+from bson import ObjectId
+from gridfs.errors import NoFile
 from motor.motor_asyncio import AsyncIOMotorDatabase, AsyncIOMotorGridFSBucket
 
 from app.config import get_settings
 from app.repositories.base import MongoRepository
-from app.utils.mongo import object_id
 from app.utils.time import utcnow
 
 logger = logging.getLogger("medilink.document_summary")
@@ -50,6 +52,11 @@ class SummaryError(Exception):
     """Message is safe to show to people."""
 
 
+# read_bytes() raises these when a record's file is gone (server disk wiped, or GridFS file deleted).
+MISSING_FILE_ERRORS = (FileNotFoundError, NoFile)
+MISSING_FILE_MESSAGE = "This file is missing from the server. Delete it and upload it again."
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -80,12 +87,42 @@ def docx_text(data: bytes) -> str:
     return "\n".join(line for line in lines if line.strip())
 
 
+def _gridfs_id(value) -> ObjectId:
+    if not ObjectId.is_valid(str(value)):
+        raise NoFile(f"Invalid GridFS id {value!r}")
+    return ObjectId(str(value))
+
+
+async def save_file(database: AsyncIOMotorDatabase, data: bytes, filename: str, content_type: str, metadata: dict) -> str:
+    """Stores a file in MongoDB GridFS (the default `fs` bucket) and returns its id as a string.
+    The id is only ever kept on the owning Mongo record; no route serves files by GridFS id."""
+    file_id = await AsyncIOMotorGridFSBucket(database).upload_from_stream(
+        filename, data, metadata={**metadata, "contentType": content_type, "sha256": sha256(data)},
+    )
+    return str(file_id)
+
+
+async def delete_file(database: AsyncIOMotorDatabase, record: dict) -> None:
+    """Removes a record's stored file: GridFS for new records, disk for legacy `storagePath` ones.
+    An already-missing file is not an error."""
+    if record.get("gridfsId"):
+        try:
+            await AsyncIOMotorGridFSBucket(database).delete(_gridfs_id(record["gridfsId"]))
+        except NoFile:
+            pass
+    elif record.get("storagePath"):
+        (storage_root() / record["storagePath"]).unlink(missing_ok=True)
+
+
 async def read_bytes(database: AsyncIOMotorDatabase, record: dict) -> bytes:
+    """File bytes for a record. New records live in GridFS (`gridfsId`); older ones on disk
+    (`storagePath`). Raises one of MISSING_FILE_ERRORS when the file is gone."""
+    if record.get("gridfsId"):
+        stream = await AsyncIOMotorGridFSBucket(database).open_download_stream(_gridfs_id(record["gridfsId"]))
+        return await stream.read()
     if record.get("storagePath"):
         return (storage_root() / record["storagePath"]).read_bytes()
-    # Records uploaded before the move to disk still live in GridFS.
-    stream = await AsyncIOMotorGridFSBucket(database).open_download_stream(object_id(record["gridfsId"]))
-    return await stream.read()
+    raise FileNotFoundError("Record has no stored file")
 
 
 def _parts(record: dict, data: bytes) -> list:
@@ -117,34 +154,48 @@ async def _gemini(parts: list, prompt: str) -> dict:
         raise SummaryError("Nothing to summarize.")
     client = genai.Client(api_key=settings.llm_api_key)
     config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, response_mime_type="application/json", temperature=0.2)
-    delay = 2.0
-    for attempt in range(4):
-        try:
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(model=settings.llm_model, contents=[*parts, prompt], config=config),
-                timeout=30,
-            )
-        except asyncio.TimeoutError:
-            raise SummaryError("The AI service took too long. Please try again.")
-        except errors.APIError as exc:
-            if exc.code in (429, 503) and attempt < 3:  # Rate limit / overloaded: back off and retry.
+    models = [m for m in dict.fromkeys([settings.llm_model, settings.llm_fallback_model]) if m]
+    attempts = max(0, settings.llm_max_retries) + 1
+    last_error = "busy"
+    # Bounded: at most len(models) * attempts calls. Timeouts and 429/503 are retried with backoff;
+    # an unknown model (404) moves straight to the fallback; any other API error fails at once.
+    for model in models:
+        delay = 2.0
+        for attempt in range(attempts):
+            try:
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(model=model, contents=[*parts, prompt], config=config),
+                    timeout=settings.llm_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Gemini timeout (model=%s, attempt %d/%d)", model, attempt + 1, attempts)
+                last_error = "timeout"
+            except errors.APIError as exc:
+                logger.warning("Gemini API error %s (model=%s, attempt %d/%d)", exc.code, model, attempt + 1, attempts)
+                if exc.code == 404:
+                    last_error = "model"
+                    break
+                if exc.code not in (429, 503):
+                    raise SummaryError("The AI service couldn't read this file. Please try again later.")
+                last_error = "busy"
+            else:
+                text = (response.text or "").strip()
+                if not text:
+                    raise SummaryError("The AI service returned an empty summary. Please try again.")
+                try:
+                    result = json.loads(text)
+                except json.JSONDecodeError:
+                    raise SummaryError("The AI service returned an unreadable summary. Please try again.")
+                if not isinstance(result, dict):
+                    raise SummaryError("The AI service returned an unreadable summary. Please try again.")
+                return result
+            if attempt + 1 < attempts:
                 await asyncio.sleep(delay)
                 delay *= 2
-                continue
-            logger.warning("Gemini API error %s", exc.code)
-            raise SummaryError("The AI service is busy. Please try again in a minute." if exc.code in (429, 503)
-                               else "The AI service couldn't read this file. Please try again later.")
-        text = (response.text or "").strip()
-        if not text:
-            raise SummaryError("The AI service returned an empty summary. Please try again.")
-        try:
-            result = json.loads(text)
-        except json.JSONDecodeError:
-            raise SummaryError("The AI service returned an unreadable summary. Please try again.")
-        if not isinstance(result, dict):
-            raise SummaryError("The AI service returned an unreadable summary. Please try again.")
-        return result
-    raise SummaryError("The AI service is busy. Please try again in a minute.")
+    raise SummaryError({
+        "timeout": "The AI service took too long. Please try again.",
+        "model": "The AI service isn't configured correctly on this server.",
+    }.get(last_error, "The AI service is busy. Please try again in a minute."))
 
 
 # ponytail: in-process job registry; fine for one uvicorn worker, move to a queue if scaled out.
@@ -179,7 +230,10 @@ async def document_summary(database: AsyncIOMotorDatabase, record: dict, regener
 
     async def run():
         try:
-            data = await read_bytes(database, record)
+            try:
+                data = await read_bytes(database, record)
+            except MISSING_FILE_ERRORS:
+                raise SummaryError(MISSING_FILE_MESSAGE)
             file_hash = sha256(data)
             summary = await _gemini(_parts(record, data), f"Summarize this document. File name: {record.get('filename')}.")
             summary["disclaimer"] = DISCLAIMER  # Always present, whatever the model returned.
@@ -214,16 +268,29 @@ async def combined_summary(database: AsyncIOMotorDatabase, patient_id: str, reco
 
     async def run():
         try:
-            parts, total = [], 0
-            for i, r in enumerate(records, 1):
-                data = await read_bytes(database, r)
+            parts, total, included, skipped = [], 0, 0, []
+            for r in records:
+                # One missing or unreadable file must not sink the whole summary: skip it and say so.
+                try:
+                    data = await read_bytes(database, r)
+                    doc_parts = _parts(r, data)
+                except MISSING_FILE_ERRORS:
+                    skipped.append({"documentId": r["id"], "filename": r.get("filename"), "reason": MISSING_FILE_MESSAGE})
+                    continue
+                except SummaryError as exc:
+                    skipped.append({"documentId": r["id"], "filename": r.get("filename"), "reason": str(exc)})
+                    continue
                 total += len(data)
                 if total > INLINE_LIMIT:
                     raise SummaryError("These files are too large to summarize together. Summarize them one at a time.")
-                parts.append(f"Document {i} (documentId {r['id']}, file name {r.get('filename')}):")
-                parts.extend(_parts(r, data))
-            summary = await _gemini(parts, f"Summarize these {len(records)} documents.")
+                included += 1
+                parts.append(f"Document {included} (documentId {r['id']}, file name {r.get('filename')}):")
+                parts.extend(doc_parts)
+            if not included:
+                raise SummaryError("None of your reports could be read. Delete them and upload them again.")
+            summary = await _gemini(parts, f"Summarize these {included} documents.")
             summary["disclaimer"] = DISCLAIMER
+            summary["skippedDocuments"] = skipped
             await save({"status": "READY", "summary": summary, "signature": signature, "generatedAt": utcnow(),
                         "documentIds": [r["id"] for r in records]})
         except SummaryError as exc:

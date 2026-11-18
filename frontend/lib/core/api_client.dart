@@ -18,16 +18,15 @@ class ApiClient {
   ApiClient(this._session, {http.Client? client})
     : _client = client ?? http.Client();
 
-  static const _defaultBaseUrl = String.fromEnvironment(
-    'MEDILINK_API_URL',
-    defaultValue: 'http://10.0.2.2:8000/api',
-  );
   final SessionController _session;
   final http.Client _client;
 
-  Uri _uri(String path, [Map<String, String>? query]) =>
-      Uri.parse('${_session.apiBaseUrl ?? _defaultBaseUrl}$path')
-          .replace(queryParameters: query);
+  Uri _uri(String path, [Map<String, String>? query]) {
+    // No backend route ends in '/'; a trailing slash makes FastAPI answer 307.
+    final clean = path.length > 1 && path.endsWith('/') ? path.substring(0, path.length - 1) : path;
+    return Uri.parse('${_session.effectiveApiBaseUrl}$clean')
+        .replace(queryParameters: query);
+  }
 
   Future<dynamic> get(String path, {Map<String, String>? query}) =>
       _request('GET', path, query: query);
@@ -54,9 +53,21 @@ class ApiClient {
       final request = http.Request(method, _uri(path, query))
         ..headers.addAll(headers)
         ..body = body == null ? '' : jsonEncode(body);
-      final response = await _client
+      var response = await _client
           .send(request)
           .timeout(const Duration(seconds: 20));
+      // dart:io follows redirects only for GET/HEAD. 307/308 mean "same method, same body", so
+      // re-send once -- same host only, so the bearer token never leaves the backend.
+      final location = response.headers['location'];
+      if ((response.statusCode == 307 || response.statusCode == 308) && location != null) {
+        final target = request.url.resolve(location);
+        if (target.host == request.url.host) {
+          await response.stream.drain<void>();
+          response = await _client
+              .send(http.Request(method, target)..headers.addAll(headers)..body = request.body)
+              .timeout(const Duration(seconds: 20));
+        }
+      }
       final text = await response.stream.bytesToString();
       final data = text.isEmpty ? null : jsonDecode(text);
       if (response.statusCode >= 200 && response.statusCode < 300) return data;
@@ -196,7 +207,7 @@ class ApiClient {
   /// Unauthenticated backend status (call provider / mode), used only to render an honest
   /// "sandbox — verified numbers only" style notice rather than hardcoding it in the UI.
   Future<Map<String, dynamic>> systemStatus() async {
-    final root = (_session.apiBaseUrl ?? _defaultBaseUrl).replaceFirst(RegExp(r'/api$'), '');
+    final root = _session.effectiveApiBaseUrl.replaceFirst(RegExp(r'/api$'), '');
     final response = await _client.get(Uri.parse('$root/healthz')).timeout(const Duration(seconds: 10));
     return Map<String, dynamic>.from(jsonDecode(response.body) as Map);
   }

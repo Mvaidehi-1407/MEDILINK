@@ -35,10 +35,15 @@ class Settings(BaseSettings):
     nominatim_base_url: str = "https://nominatim.openstreetmap.org"
     # GEMINI_* names are preferred; the older LLM_* names in existing .env files still work.
     llm_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("GEMINI_API_KEY", "LLM_API_KEY", "llm_api_key"))
-    llm_model: str = Field("gemini-3.6-flash", validation_alias=AliasChoices("GEMINI_MODEL", "LLM_MODEL", "llm_model"))
+    llm_model: str = Field("gemini-3.5-flash", validation_alias=AliasChoices("GEMINI_MODEL", "LLM_MODEL", "llm_model"))
+    # Tried once the main model is still busy/slow/unknown after its retries. Empty disables it.
+    llm_fallback_model: str = Field("gemini-3.5-flash-lite", validation_alias=AliasChoices("GEMINI_FALLBACK_MODEL", "LLM_FALLBACK_MODEL", "llm_fallback_model"))
+    # Per-call Gemini timeout and extra attempts per model (timeouts and 429/503 only).
     llm_timeout_seconds: float = 45.0
+    llm_max_retries: int = 2
     max_upload_bytes: int = 20 * 1024 * 1024
-    # Vault files live on the backend disk; only metadata goes to Mongo.
+    # New vault/chat files go to MongoDB GridFS. This folder is only read for older records that
+    # still carry a `storagePath`.
     storage_dir: str = "./storage"
     # Base URL a phone camera can open (LAN IP in dev, domain in prod) for QR share pages.
     public_base_url: str = "http://localhost:8000"

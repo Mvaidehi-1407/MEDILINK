@@ -1,20 +1,23 @@
 import base64
-import uuid
+import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import Response
-from motor.motor_asyncio import AsyncIOMotorDatabase, AsyncIOMotorGridFSBucket
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
+from pymongo.errors import PyMongoError
 
 from app.config import get_settings
 from app.dependencies import db, get_current_user
 from app.repositories.base import MongoRepository
 from app.services.consent_service import ConsentService
-from app.services.document_summary import DOCX, EXTENSIONS, docx_text, heic_to_jpeg, read_bytes, sha256, storage_root
-from app.utils.mongo import object_id
+from app.services.document_summary import (
+    DOCX, EXTENSIONS, MISSING_FILE_ERRORS, delete_file, docx_text, heic_to_jpeg, read_bytes, save_file, sha256,
+)
 from app.utils.time import utcnow
 
 
+logger = logging.getLogger("medilink.medical_records")
 router = APIRouter(prefix="/medical-records", tags=["medical-records"])
 CATEGORIES = {"Lab", "Prescription", "Scan", "Other"}
 
@@ -59,19 +62,30 @@ async def upload_record(
     except Exception:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This file couldn't be opened. Check it isn't damaged and try again.")
 
-    stored = f"{uuid.uuid4().hex}.{'jpg' if content_type == 'image/jpeg' else ext}"
-    (storage_root() / stored).write_bytes(data)
-    return await MongoRepository(database, "medical_records").insert({
-        "patientId": patientId,
-        "ownerId": user["id"],
-        "filename": filename,
-        "contentType": content_type,
-        "category": category if category in CATEGORIES else "Other",
-        "size": len(data),
-        "storagePath": stored,
-        "fileHash": sha256(data),
-        "createdAt": utcnow(),
-    })
+    # File goes to GridFS first; the record only exists once its file does. If the record insert
+    # fails, the just-stored file is removed so no orphan is left behind.
+    try:
+        gridfs_id = await save_file(database, data, filename, content_type,
+                                    {"kind": "medical_record", "patientId": patientId, "ownerId": user["id"]})
+    except PyMongoError:
+        logger.exception("GridFS upload failed")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We couldn't save this file. Please try again.")
+    try:
+        return await MongoRepository(database, "medical_records").insert({
+            "patientId": patientId,
+            "ownerId": user["id"],
+            "filename": filename,
+            "contentType": content_type,
+            "category": category if category in CATEGORIES else "Other",
+            "size": len(data),
+            "gridfsId": gridfs_id,
+            "fileHash": sha256(data),
+            "createdAt": utcnow(),
+        })
+    except Exception:
+        logger.exception("Medical record insert failed; removing its GridFS file")
+        await delete_file(database, {"gridfsId": gridfs_id})
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We couldn't save this file. Please try again.")
 
 
 @router.get("")
@@ -85,13 +99,21 @@ async def list_records(patientId: str | None = None, user: dict = Depends(get_cu
     return allowed
 
 
+async def _file_bytes(database: AsyncIOMotorDatabase, record: dict) -> bytes:
+    """Stored file (GridFS or legacy disk); 404 when it's gone, 503 when Mongo can't be reached."""
+    try:
+        return await read_bytes(database, record)
+    except MISSING_FILE_ERRORS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This file is missing from the server.")
+    except PyMongoError:
+        logger.exception("GridFS read failed for record %s", record.get("id"))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We couldn't load this file. Please try again.")
+
+
 @router.get("/{record_id}")
 async def download_record(record_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     record = await get_record(record_id, user, database)
-    try:
-        data = await read_bytes(database, record)
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This file is missing from the server.")
+    data = await _file_bytes(database, record)
     return Response(data, media_type=record["contentType"], headers={"Content-Disposition": f"attachment; filename=\"{record['filename']}\""})
 
 
@@ -99,7 +121,7 @@ async def download_record(record_id: str, user: dict = Depends(get_current_user)
 async def record_text(record_id: str, user: dict = Depends(get_current_user), database: AsyncIOMotorDatabase = Depends(db)):
     """Plain text for the in-app DOCX / text viewer."""
     record = await get_record(record_id, user, database)
-    data = await read_bytes(database, record)
+    data = await _file_bytes(database, record)
     if record["contentType"] == DOCX:
         return {"text": docx_text(data)}
     if record["contentType"] == "text/plain":
@@ -115,8 +137,9 @@ async def pdf_page(record_id: str, page: int, user: dict = Depends(get_current_u
     record = await get_record(record_id, user, database)
     if record["contentType"] != "application/pdf":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This file isn't a PDF.")
+    data = await _file_bytes(database, record)
     try:
-        pdf = pdfium.PdfDocument(await read_bytes(database, record))
+        pdf = pdfium.PdfDocument(data)
     except Exception:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This PDF couldn't be opened.")
     try:
@@ -156,9 +179,11 @@ async def delete_record(record_id: str, user: dict = Depends(get_current_user), 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Medical record not found")
     if record["ownerId"] != user["id"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the owner can delete this record")
-    if record.get("storagePath"):
-        (storage_root() / record["storagePath"]).unlink(missing_ok=True)
-    elif record.get("gridfsId"):
-        await AsyncIOMotorGridFSBucket(database).delete(object_id(record["gridfsId"]))
     await MongoRepository(database, "medical_records").delete(record_id)
+    # Record first, then its file (GridFS or legacy disk): a failed file delete leaves an
+    # unreferenced file to clean up, never a visible record whose file is gone.
+    try:
+        await delete_file(database, record)
+    except Exception:
+        logger.exception("Stored file for deleted record %s could not be removed", record_id)
     return {"deleted": True}
