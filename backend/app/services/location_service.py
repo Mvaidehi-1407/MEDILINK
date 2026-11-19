@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import math
 from typing import Any, Dict, Optional
 
@@ -8,12 +10,17 @@ from app.config import Settings, get_settings
 from app.repositories.base import MongoRepository
 from app.utils.mongo import serialize_doc
 
+logger = logging.getLogger(__name__)
+
 _OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Same public mirrors the app's Find Hospitals screen uses; queried together, nearest answer wins,
+# so one slow/blocked mirror (common from shared cloud IPs like Render's) can't drop the hospital.
+_OVERPASS_URLS = (_OVERPASS_URL, "https://overpass.private.coffee/api/interpreter", "https://overpass.kumi.systems/api/interpreter")
 # OSM services reject generic client User-Agents (overpass-api.de answers 406 to them) and their
 # usage policies ask for an identifying one. No personal data in it.
 _USER_AGENT = "MediLink/1.0 (emergency alert service; +https://medilink-backend-6a75.onrender.com)"
 _NOMINATIM_TIMEOUT = 4.0
-_OVERPASS_TIMEOUT = 5.0
+_OVERPASS_TIMEOUT = 10.0  # overpass-api.de often needs >5 s; mirrors run in parallel so this is the worst case.
 
 
 def _address_from_tags(tags: Dict[str, Any]) -> Optional[str]:
@@ -78,12 +85,16 @@ class LocationService:
         for box in (2000, 5000, radius):
             found = await self._nearest_hospital_nominatim(latitude, longitude, min(box, radius))
             if found is False:  # Nominatim errored (not "no hospitals") -- try the other OSM source.
-                return await self.nearest_hospital_overpass(latitude, longitude, radius)
+                break
             if found:
                 return found
             if box >= radius:
                 break
-        return None
+        # Nominatim failed or only knows amenity=hospital; Overpass also covers healthcare=hospital.
+        found = await self.nearest_hospital_overpass(latitude, longitude, radius)
+        if not found:
+            logger.warning("Nearest hospital lookup found nothing for %.5f,%.5f within %d m (Nominatim and Overpass)", latitude, longitude, radius)
+        return found
 
     async def _nearest_hospital_nominatim(self, latitude: float, longitude: float, radius: int) -> Optional[Dict[str, Any]] | bool:
         """Returns the nearest hospital, None when there is none within `radius`, or False on error."""
@@ -99,8 +110,10 @@ class LocationService:
                 response.raise_for_status()
                 results = response.json()
             if not isinstance(results, list):
+                logger.warning("Nominatim hospital search returned non-list: %r", results)
                 return False
-        except Exception:
+        except Exception as exc:
+            logger.warning("Nominatim hospital search failed: %s: %s", type(exc).__name__, exc)
             return False
         best = None
         for item in results:
@@ -123,7 +136,7 @@ class LocationService:
         nearest_hospital(). Best-effort, single attempt: returns None on any failure or empty
         result so callers (escalation_messages.py) degrade gracefully rather than block an SMS."""
         query = (
-            f"[out:json][timeout:5];\n"
+            f"[out:json][timeout:9];\n"
             f"(\n"
             f'  node["amenity"="hospital"](around:{radius},{latitude},{longitude});\n'
             f'  way["amenity"="hospital"](around:{radius},{latitude},{longitude});\n'
@@ -131,14 +144,17 @@ class LocationService:
             f");\n"
             f"out center tags 20;\n"
         )
-        try:
-            async with httpx.AsyncClient(timeout=_OVERPASS_TIMEOUT, headers={"User-Agent": _USER_AGENT}) as client:
-                response = await client.post(_OVERPASS_URL, data={"data": query})
-                response.raise_for_status()
-                elements = response.json().get("elements", [])
-        except Exception:
-            return None
+        async def fetch(url: str) -> list:
+            try:
+                async with httpx.AsyncClient(timeout=_OVERPASS_TIMEOUT, headers={"User-Agent": _USER_AGENT}) as client:
+                    response = await client.post(url, data={"data": query})
+                    response.raise_for_status()
+                    return response.json().get("elements", [])
+            except Exception as exc:
+                logger.warning("Overpass hospital search failed at %s: %s: %s", url, type(exc).__name__, exc)
+                return []
 
+        elements = [e for batch in await asyncio.gather(*(fetch(u) for u in _OVERPASS_URLS)) for e in batch]
         nearest, nearest_distance = None, None
         for element in elements:
             centre = element.get("center") or {}

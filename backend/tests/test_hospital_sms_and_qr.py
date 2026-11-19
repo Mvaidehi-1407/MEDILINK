@@ -46,9 +46,11 @@ def test_nearest_hospital_uses_nominatim_small_box_first(monkeypatch):
 
 
 def test_nearest_hospital_widens_only_when_empty_and_never_invents(monkeypatch):
-    calls = _fake_http(monkeypatch, lambda r: httpx.Response(200, json=[]))
+    calls = _fake_http(monkeypatch, lambda r: httpx.Response(200, json=[] if r.url.host == "nominatim.openstreetmap.org" else {"elements": []}))
     assert asyncio.run(ls.LocationService(None).nearest_hospital(17.385, 78.4867)) is None
-    assert len(calls) == 3  # 2 km, 5 km, 10 km -- all real searches, nothing made up.
+    hosts = [c.url.host for c in calls]
+    assert hosts[:3] == ["nominatim.openstreetmap.org"] * 3  # 2 km, 5 km, 10 km -- all real searches, nothing made up.
+    assert len(hosts) == 3 + len(ls._OVERPASS_URLS)  # then every Overpass mirror once.
 
 
 def test_nearest_hospital_falls_back_to_overpass_when_nominatim_fails(monkeypatch):
@@ -60,7 +62,24 @@ def test_nearest_hospital_falls_back_to_overpass_when_nominatim_fails(monkeypatc
     calls = _fake_http(monkeypatch, handler)
     found = asyncio.run(ls.LocationService(None).nearest_hospital(17.385, 78.4867))
     assert found["name"] == "OSM Hospital" and found["latitude"] == 17.386
-    assert [c.url.host for c in calls] == ["nominatim.openstreetmap.org", "overpass-api.de"]
+    assert calls[0].url.host == "nominatim.openstreetmap.org" and "overpass-api.de" in [c.url.host for c in calls]
+
+
+def test_overpass_survives_a_blocked_mirror_and_logs_it(monkeypatch, caplog):
+    """Render's shared IP is often refused/slow at one OSM endpoint -- the SMS must still get the hospital."""
+    def handler(request):
+        if request.url.host in ("nominatim.openstreetmap.org", "overpass-api.de"):
+            return httpx.Response(403, text="blocked")
+        return httpx.Response(200, json={"elements": [{"type": "way", "center": {"lat": 17.386, "lon": 78.4867},
+                                                       "tags": {"name": "Mirror Hospital", "addr:street": "MG Road", "addr:city": "Hyderabad"}}]})
+
+    _fake_http(monkeypatch, handler)
+    with caplog.at_level("WARNING"):
+        found = asyncio.run(ls.LocationService(None).nearest_hospital(17.385, 78.4867))
+    assert found["name"] == "Mirror Hospital" and found["address"] == "MG Road, Hyderabad"
+    assert "Nominatim hospital search failed" in caplog.text and "overpass-api.de" in caplog.text
+    msg = contact_alert_message({"name": "P"}, {"location": {"coordinates": [78.4867, 17.385]}}, found)
+    assert "Nearest hospital: Mirror Hospital -- MG Road, Hyderabad -- https://maps.google.com/?q=17.386,78.4867" in msg
 
 
 def test_sms_carries_real_hospital_and_maps_links():
