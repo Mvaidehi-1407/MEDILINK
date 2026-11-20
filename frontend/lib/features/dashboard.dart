@@ -134,6 +134,12 @@ class _RoleShellState extends ConsumerState<RoleShell>
         return;
       }
       if (name == 'emergency.updated') {
+        final data = event['data'];
+        debugPrint(
+          '[SOS] emergency.updated received: id=${data is Map ? data['id'] : '?'} '
+          'status=${data is Map ? data['status'] : '?'} '
+          '(countdown opens only for VERIFICATION; pageOpen=$_emergencyPageOpen)',
+        );
         _maybeAutoNavigateToConfirmation(event['data']);
         return;
       }
@@ -260,6 +266,13 @@ class _RoleShellState extends ConsumerState<RoleShell>
     ref.listen<BleState>(bleProvider, (previous, next) {
       if (role == 'PATIENT' && next.sosSignal != (previous?.sosSignal ?? 0)) {
         _openEmergencyTabForSos();
+      }
+      final detectedId = next.detectedEmergencyId;
+      if (role == 'PATIENT' &&
+          detectedId != null &&
+          next.emergencySignal != (previous?.emergencySignal ?? 0)) {
+        // Same guarded path as the emergency.updated push (skips if already showing).
+        _openConfirmationScreen(detectedId);
       }
     });
     final views = role == 'PATIENT'
@@ -925,12 +938,19 @@ class BleVitals {
       if (eq <= 0) continue;
       fields[part.substring(0, eq)] = part.substring(eq + 1);
     }
-    final heartRate = int.tryParse(fields['HR'] ?? '');
-    final spo2 = int.tryParse(fields['SPO2'] ?? '');
+    // num, not int: a MAX30100 library often reports SpO2/HR as decimals ("97.5"), which
+    // int.tryParse rejected -- dropping the whole reading. Rounded like the JSON path's `_int`.
+    int? whole(String? v) {
+      final n = num.tryParse(v?.trim() ?? '');
+      return n == null || !n.isFinite ? null : n.round();
+    }
+
+    final heartRate = whole(fields['HR']);
+    final spo2 = whole(fields['SPO2']);
     final bp = (fields['BP'] ?? '').split('/');
-    final systolic = bp.length == 2 ? int.tryParse(bp[0]) : null;
-    final diastolic = bp.length == 2 ? int.tryParse(bp[1]) : null;
-    final temperature = double.tryParse(fields['TEMP'] ?? '');
+    final systolic = bp.length == 2 ? whole(bp[0]) : null;
+    final diastolic = bp.length == 2 ? whole(bp[1]) : null;
+    final temperature = double.tryParse(fields['TEMP']?.trim() ?? '');
     if (heartRate == null ||
         spo2 == null ||
         systolic == null ||
@@ -1021,6 +1041,8 @@ class BleState {
     this.lastSubmittedAt,
     this.retryAt,
     this.sosSignal = 0,
+    this.emergencySignal = 0,
+    this.detectedEmergencyId,
   });
 
   final BluetoothDevice? device;
@@ -1042,6 +1064,12 @@ class BleState {
   /// a bool would look unchanged and `ref.listen` would never fire again.
   final int sosSignal;
 
+  /// Increments when the backend's reply to a submitted reading names a NEW emergency in
+  /// VERIFICATION. RoleShell opens the countdown for [detectedEmergencyId] -- the same screen the
+  /// `emergency.updated` WebSocket push opens, so the alert no longer depends on that push alone.
+  final int emergencySignal;
+  final String? detectedEmergencyId;
+
   bool get isBusy =>
       status == BleStatus.connecting ||
       status == BleStatus.discovering ||
@@ -1056,6 +1084,8 @@ class BleState {
     DateTime? lastSubmittedAt,
     DateTime? retryAt,
     int? sosSignal,
+    int? emergencySignal,
+    String? detectedEmergencyId,
     bool clearMessage = false,
     bool clearRetryAt = false,
   }) => BleState(
@@ -1067,6 +1097,8 @@ class BleState {
     lastSubmittedAt: lastSubmittedAt ?? this.lastSubmittedAt,
     retryAt: clearRetryAt ? null : retryAt ?? this.retryAt,
     sosSignal: sosSignal ?? this.sosSignal,
+    emergencySignal: emergencySignal ?? this.emergencySignal,
+    detectedEmergencyId: detectedEmergencyId ?? this.detectedEmergencyId,
   );
 }
 
@@ -1096,6 +1128,13 @@ class BleController extends Notifier<BleState> {
   StreamSubscription<List<int>>? _vitalsSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   final List<int> _frameBuffer = [];
+  // A `DATA|`/`SOS|` reading with no `\n` used to sit in the buffer until the NEXT reading's
+  // marker arrived -- a one-off packet was never processed at all. Fragments of one notification
+  // arrive back-to-back, so a short quiet gap means the buffered reading is complete.
+  // ponytail: idle-gap framing; if a link ever pauses >300 ms mid-packet, send `\n` from firmware.
+  static const _frameIdleFlush = Duration(milliseconds: 300);
+  Timer? _frameFlushTimer;
+  String? _lastSignaledEmergencyId;
   bool _disconnectRequested = false;
   bool _submitting = false;
   DateTime? _lastSubmitAt;
@@ -1309,7 +1348,10 @@ class BleController extends Notifier<BleState> {
   // bytes -- a single JSON message is fragmented across many notifications, so it must be
   // reassembled from the persistent `_frameBuffer` rather than parsed notification-by-notification.
   void _onNotification(List<int> packet) {
-    debugPrint('BLE RX CHUNK: ${utf8.decode(packet, allowMalformed: true)}');
+    debugPrint(
+      '[BLE] raw data received (${packet.length} bytes): '
+      '${utf8.decode(packet, allowMalformed: true)} | hex=${packet.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}',
+    );
     _frameBuffer.addAll(packet);
     // Newline-delimited JSON (the originally spec'd protocol) -- kept working in case a device
     // ever sends it.
@@ -1326,6 +1368,20 @@ class BleController extends Notifier<BleState> {
     _extractPipeFrames();
     // A device that never sends any recognizable delimiter must not grow this buffer without bound.
     if (_frameBuffer.length > _maxFrameBytes) _frameBuffer.clear();
+    _frameFlushTimer?.cancel();
+    if (_frameBuffer.isNotEmpty) {
+      _frameFlushTimer = Timer(_frameIdleFlush, _flushIdleFrame);
+    }
+  }
+
+  /// Processes a buffered pipe-format reading once the link has gone quiet (see
+  /// [_frameIdleFlush]). Only flushes text that starts with a known marker, so a half-received
+  /// JSON object (newline-framed) is never parsed early.
+  void _flushIdleFrame() {
+    final text = utf8.decode(_frameBuffer, allowMalformed: true).trim();
+    if (!_pipeFrameMarkers.any(text.startsWith)) return;
+    _frameBuffer.clear();
+    _handleFrame(utf8.encode(text));
   }
 
   // 'MEDILINK SOS' is a standalone marker packet (no vitals of its own) the wearable sends
@@ -1372,9 +1428,18 @@ class BleController extends Notifier<BleState> {
       return;
     }
     final vitals = BleVitals.tryParse(frame);
-    if (vitals == null)
+    if (vitals == null) {
+      debugPrint('[PARSE] rejected (not sent to backend/ML): "$text"');
       return; // tryParse already logged BLE: INVALID JSON/READING
+    }
     debugPrint('BLE: VITALS PARSED');
+    debugPrint(
+      '[PARSE] HR=${vitals.heartRate} (int, bpm) | SpO2=${vitals.spo2} (int, %) | '
+      'BP=${vitals.systolicBP}/${vitals.diastolicBP} (int/int, mmHg) | '
+      'Temp=${vitals.temperature} (double, °C) | '
+      'motionIntensity=${vitals.motionIntensity ?? 'MISSING'} | eventType=${vitals.eventType} | '
+      'deviceId=${vitals.deviceId}',
+    );
     var isSos = vitals.isSos;
     if (_sosPending) {
       // Only this one reading -- the next after the marker -- is the SOS trigger; every packet
@@ -1385,6 +1450,11 @@ class BleController extends Notifier<BleState> {
       isSos = true;
       _sosPending = false;
     }
+    debugPrint(
+      isSos
+          ? '[SOS] triggered by wearable (eventType=${vitals.eventType}, marker=${vitals.isSos ? 'no' : 'yes'})'
+          : '[SOS] not triggered by wearable: ordinary VITALS packet -- backend risk engine decides',
+    );
     if (isSos) {
       debugPrint('SOS TRIGGERED');
       debugPrint('BLE: SOS DETECTED');
@@ -1409,15 +1479,24 @@ class BleController extends Notifier<BleState> {
   Future<void> _submit(BleVitals vitals, {bool isSos = false}) async {
     final now = DateTime.now();
     if (!isSos) {
-      if (_submitting) return;
+      if (_submitting) {
+        debugPrint('[ML] not sent: previous reading still being submitted');
+        return;
+      }
       if (_lastSubmitAt != null &&
           now.difference(_lastSubmitAt!) < _minSubmitInterval) {
+        debugPrint(
+          '[ML] not sent: throttled (${_minSubmitInterval.inSeconds}s interval) -- display only',
+        );
         state = state.copyWith(lastVitals: vitals);
         return;
       }
     }
     final patientId = ref.read(sessionProvider).userId;
-    if (patientId.isEmpty) return;
+    if (patientId.isEmpty) {
+      debugPrint('[ML] not sent: no patientId in session (not logged in as patient?)');
+      return;
+    }
     if (!isSos) {
       _submitting = true;
       _lastSubmitAt = now;
@@ -1444,8 +1523,23 @@ class BleController extends Notifier<BleState> {
           ? 'BLE: SOS HEALTH SUBMISSION STARTED'
           : 'BLE: SUBMITTING HEALTH READING',
     );
+    debugPrint('[ML] input sent to POST /health/readings: $payload');
     try {
-      await ref.read(apiClientProvider).submitReading(payload);
+      final response = await ref.read(apiClientProvider).submitReading(payload);
+      _logBackendDecision(response);
+      final emergency = response['emergency'];
+      final emergencyId = emergency is Map ? emergency['id']?.toString() : null;
+      if (emergencyId != null &&
+          emergency['status']?.toString() == 'VERIFICATION' &&
+          emergencyId != _lastSignaledEmergencyId) {
+        // Once per emergency: an open one is returned again with every later reading.
+        _lastSignaledEmergencyId = emergencyId;
+        debugPrint('[SOS] opening countdown from API response for $emergencyId');
+        state = state.copyWith(
+          detectedEmergencyId: emergencyId,
+          emergencySignal: state.emergencySignal + 1,
+        );
+      }
       debugPrint(
         isSos
             ? 'BLE: SOS HEALTH SUBMISSION SUCCEEDED'
@@ -1464,6 +1558,9 @@ class BleController extends Notifier<BleState> {
             ? 'BLE: SOS HEALTH SUBMISSION FAILED'
             : 'BLE: HEALTH READING SUBMISSION FAILED',
       );
+      debugPrint(
+        '[ML] request failed: status=${error.statusCode} message=${error.message} -- reading NOT classified',
+      );
       state = state.copyWith(
         lastVitals: vitals,
         message: 'Reading not accepted: ${error.message}',
@@ -1473,7 +1570,31 @@ class BleController extends Notifier<BleState> {
     }
   }
 
+  /// Diagnostic only: the backend's model output and emergency decision for one reading.
+  static void _logBackendDecision(Map<String, dynamic> response) {
+    final reading = response['reading'];
+    final risk = reading is Map ? reading['risk'] : null;
+    debugPrint(
+      risk is Map
+          ? '[ML] output: riskLevel=${risk['riskLevel']} riskScore=${risk['riskScore']} '
+                'engineUsed=${risk['engineUsed']} modelVersion=${risk['modelVersion']} '
+                'signals=${risk['detectedSignals']} tier=${risk['tierPrediction']} '
+                'confidence=${risk['confidence']}'
+          : '[ML] output: no risk result in response',
+    );
+    final emergency = response['emergency'];
+    debugPrint(
+      emergency is Map
+          ? '[SOS] backend emergency for this reading: id=${emergency['id']} '
+                'status=${emergency['status']} trigger=${emergency['trigger']} '
+                '(an existing open emergency is returned unchanged -- see backend [SOS] log)'
+          : '[SOS] not triggered by backend: no emergency returned for this reading',
+    );
+  }
+
   void _cancelSubscriptions() {
+    _frameFlushTimer?.cancel();
+    _frameFlushTimer = null;
     _vitalsSubscription?.cancel();
     _vitalsSubscription = null;
     _connectionSubscription?.cancel();

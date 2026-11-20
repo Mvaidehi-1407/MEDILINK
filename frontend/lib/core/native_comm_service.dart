@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -45,12 +46,19 @@ class NativeCommService {
     final message = attempt['message']?.toString();
     final cycle = attempt['cycle'];
     final priority = attempt['priority'];
-    if (phone == null || message == null) return;
+    debugPrint('[SOS] escalation.attempt received: emergency=$emergencyId contact=${attempt['contactName']} '
+        'priority=$priority cycle=$cycle hasPhone=${phone != null} hasMessage=${message != null}');
+    if (phone == null || message == null) {
+      debugPrint('[SOS] SMS/call NOT attempted: missing contact phone or message');
+      return;
+    }
 
     final smsResult = await sendSms(phone, message);
+    debugPrint('[SOS] SMS result: ${smsResult['status']} ${smsResult['errorMessage'] ?? ''}');
     await _reportResult(api, emergencyId, 'sms', phone, cycle, priority, smsResult);
 
     final callResult = await placeCall(phone);
+    debugPrint('[SOS] call result: ${callResult['status']} ${callResult['errorMessage'] ?? ''}');
     await _reportResult(api, emergencyId, 'call', phone, cycle, priority, callResult);
   }
 
