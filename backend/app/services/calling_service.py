@@ -1,8 +1,11 @@
+import logging
 from typing import Any, Dict
 
 from app.integrations.calling_provider import EmergencyCallProvider, get_call_provider
 from app.utils.time import utcnow
 from app.websocket.manager import manager
+
+logger = logging.getLogger("medilink.calling")
 
 
 class CallingService:
@@ -42,6 +45,11 @@ class CallingService:
             "timestamp": utcnow(),
         }
         delivered = await manager.broadcast(f"patient:{patient_id}", "escalation.attempt", attempt)
+        logger.info(
+            "[SOS] escalation.attempt emergency=%s contact=%s priority=%s cycle=%s -> %s",
+            emergency_id, contact.get("name"), priority, cycle,
+            f"relayed to {delivered} device(s) for SMS+call" if delivered > 0 else "NO_DEVICE_CONNECTED (phone WebSocket not connected)",
+        )
         return {
             "provider": "NativeRelay", "channel": "relay",
             "status": "RELAYED_TO_DEVICE" if delivered > 0 else "NO_DEVICE_CONNECTED",

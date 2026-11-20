@@ -76,6 +76,12 @@ class HybridRiskEngine:
     async def evaluate(self, reading: HealthReadingCreate) -> RiskResult:
         # 1. Threshold layer: always-on, runs on every reading, not gated behind ML timeout.
         threshold_critical, threshold_signals = evaluate_threshold_critical(reading, self.settings)
+        logger.info(
+            "[ML] threshold layer patient=%s HR=%s SpO2=%s BP=%s/%s Temp=%s motion=%s -> critical=%s signals=%s",
+            reading.patientId, reading.heartRate, reading.spo2, reading.systolicBP, reading.diastolicBP,
+            reading.temperature, reading.motion.model_dump() if reading.motion else None,
+            threshold_critical, threshold_signals,
+        )
         if threshold_critical:
             return RiskResult(
                 riskLevel=RiskLevel.HIGH_RISK,
@@ -114,12 +120,16 @@ class HybridRiskEngine:
                 "spo2_percent": reading.spo2,
                 "motion_level": motion_level,
             }
-            vector, _ = reading_to_vector(raw, _ANOMALY_SCHEMA)
+            vector, names = reading_to_vector(raw, _ANOMALY_SCHEMA)
 
             loop = asyncio.get_running_loop()
             is_anomaly, score = await asyncio.wait_for(
                 loop.run_in_executor(_executor, self._anomaly_model.score, vector),
                 timeout=_INFERENCE_TIMEOUT_SECONDS,
+            )
+            logger.info(
+                "[ML] anomaly model %s patient=%s input=%s -> is_anomaly=%s score=%.4f",
+                self._anomaly_model.version, reading.patientId, dict(zip(names, vector)), is_anomaly, score,
             )
             return is_anomaly, score
         except (asyncio.TimeoutError, Exception):
@@ -145,6 +155,12 @@ class HybridRiskEngine:
         needed = max(1, self.settings.anomaly_persistence_readings)
         prior_streak = await self._recent_anomaly_streak(reading.patientId, needed)
         total_streak = prior_streak + 1
+        logger.info(
+            "[ML] persistence patient=%s anomaly_streak=%d needed=%d -> %s",
+            reading.patientId, total_streak, needed,
+            "NORMAL (not persistent yet)" if total_streak < needed
+            else ("HIGH_RISK" if score <= self.settings.anomaly_high_risk_score else "WARNING"),
+        )
 
         if total_streak < needed:
             # Anomalous but not yet persistent -- e.g. single_spike_noise. Stays NORMAL (no

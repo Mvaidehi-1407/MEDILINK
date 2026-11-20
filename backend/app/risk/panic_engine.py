@@ -179,6 +179,10 @@ class PanicEngine:
                 ),
                 timeout=_INFERENCE_TIMEOUT_SECONDS,
             )
+            logger.info(
+                "[ML] tier classifier %s patient=%s input=%s -> %s (confidence %.2f)",
+                self._tier_classifier.version, reading.patientId, sensor_values, category, _confidence,
+            )
             return category
         except (asyncio.TimeoutError, Exception):
             logger.warning("Tier classifier inference failed or timed out; falling back to panic_attack_type tier mapping.", exc_info=True)

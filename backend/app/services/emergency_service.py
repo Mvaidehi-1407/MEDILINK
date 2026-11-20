@@ -106,20 +106,31 @@ class EmergencyService:
         of what the panic engine's pattern classifier reports."""
         is_abnormal = risk.riskLevel.value in ("WARNING", "HIGH_RISK")
         existing = await self.emergencies.find_one({"patientId": reading["patientId"], "status": {"$in": _OPEN_STATUSES}})
+        patient_id = reading["patientId"]
 
         if existing and existing["status"] == EmergencyStatus.SUPERVISION.value:
+            logger.info("[SOS] patient=%s risk=%s -> updating SUPERVISION emergency %s", patient_id, risk.riskLevel.value, existing["id"])
             return await self._update_supervision(existing, reading, risk)
         if existing:
             # Already mid-flow (verification/confirmed/etc) -- don't spawn a duplicate emergency.
             # An emergency nobody ever closes would block this patient's next one forever, so a
             # sustained run of NORMAL readings closes it out here (see _track_recovery).
+            logger.info(
+                "[SOS] NOT triggered patient=%s risk=%s: blocked by open emergency %s status=%s "
+                "consecutiveNormalReadings=%s (auto-resolve needs %s NORMAL in a row; auto-resolvable=%s)",
+                patient_id, risk.riskLevel.value, existing["id"], existing["status"],
+                existing.get("consecutiveNormalReadings") or 0, self.settings.auto_resolve_normal_readings,
+                existing["status"] in _AUTO_RESOLVABLE_STATUSES,
+            )
             return await self._track_recovery(existing, is_abnormal)
         if not is_abnormal:
+            logger.info("[SOS] NOT triggered patient=%s: risk=%s is not WARNING/HIGH_RISK", patient_id, risk.riskLevel.value)
             return None
         if await self._in_cooldown(reading["patientId"]):
             # Recently resolved/cancelled -- briefly hold off opening a new one so a single
             # borderline reading right at the resolve boundary doesn't immediately reopen the
             # page. This expires on its own (see _in_cooldown); it never blocks permanently.
+            logger.info("[SOS] NOT triggered patient=%s risk=%s: cooldown after last closed emergency", patient_id, risk.riskLevel.value)
             return None
 
         now = utcnow()
@@ -130,6 +141,7 @@ class EmergencyService:
             ))
             await self._log(emergency["id"], reading["patientId"], "supervisionStart", emergency)
             await self._broadcast(emergency)
+            logger.info("[SOS] TRIGGERED patient=%s risk=%s -> SUPERVISION emergency %s (motion active)", patient_id, risk.riskLevel.value, emergency["id"])
             return emergency
 
         emergency = await self.emergencies.insert(self._new_emergency_doc(
@@ -138,6 +150,10 @@ class EmergencyService:
         ))
         await self._log(emergency["id"], reading["patientId"], "verificationStart", emergency)
         await self._broadcast(emergency)
+        logger.info(
+            "[SOS] TRIGGERED patient=%s risk=%s engine=%s signals=%s -> VERIFICATION emergency %s",
+            patient_id, risk.riskLevel.value, risk.engineUsed, risk.detectedSignals, emergency["id"],
+        )
         return emergency
 
     def _new_emergency_doc(self, reading: dict, risk: RiskResult, panic: PanicAssessment, *, status: EmergencyStatus, now, supervision_mode: bool, supervision_started_at, escalation_stage: EscalationStage) -> dict:
@@ -627,5 +643,10 @@ class EmergencyService:
         })
 
     async def _broadcast(self, emergency: dict) -> None:
-        await manager.broadcast(f"patient:{emergency['patientId']}", "emergency.updated", emergency)
+        delivered = await manager.broadcast(f"patient:{emergency['patientId']}", "emergency.updated", emergency)
+        logger.info(
+            "[SOS] emergency.updated %s status=%s delivered to %d patient WebSocket(s)%s",
+            emergency["id"], emergency.get("status"), delivered,
+            " -- NOT DELIVERED, app relies on reconnect/resume REST check" if delivered == 0 else "",
+        )
         await manager.broadcast("hospitals", "emergency.updated", emergency)
